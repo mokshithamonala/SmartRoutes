@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { useMutation, useQuery, useAction } from "convex/react";
+import { useMutation, useQuery, useAction } from "../lib/convexAdapter";
 import { api } from "../../convex/_generated/api";
 
 export function EnhancedChatBot() {
@@ -9,6 +9,7 @@ export function EnhancedChatBot() {
 
   const chatSession = useQuery(api.chat.getChatSession);
   const sendMessage = useMutation(api.chat.sendMessage);
+  const addBotResponse = useMutation(api.chat.addBotResponse);
   const generateResponse = useAction(api.aiChatbot.generateIntelligentResponse);
 
   const scrollToBottom = () => {
@@ -41,7 +42,7 @@ export function EnhancedChatBot() {
           });
           
           // Add AI response to chat
-          await sendMessage({ message: aiResponse });
+          await addBotResponse({ sessionId, response: aiResponse });
         } catch (error) {
           console.error("AI response failed:", error);
         } finally {

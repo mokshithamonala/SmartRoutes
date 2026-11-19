@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useQuery } from "convex/react";
+import { useQuery } from "../lib/convexAdapter";
 import { api } from "../../convex/_generated/api";
 
 export function LiveTrafficMap() {

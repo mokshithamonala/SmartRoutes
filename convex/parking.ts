@@ -95,6 +95,9 @@ export const updatePaymentStatus = mutation({
 export const initializeParkingData = mutation({
   args: {},
   handler: async (ctx) => {
+    const existing = await ctx.db.query("parkingSlots").first();
+    if (existing) return;
+
     const sampleParkings = [
       {
         name: "City Center Mall Parking",

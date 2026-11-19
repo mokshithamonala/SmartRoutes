@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { useMutation, useQuery, useAction } from "convex/react";
+import { useMutation, useQuery, useAction } from "../lib/convexAdapter";
 import { api } from "../../convex/_generated/api";
 
 export function ChatBot() {

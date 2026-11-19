@@ -1,6 +1,5 @@
 "use client";
-import { useAuthActions } from "@convex-dev/auth/react";
-import { useConvexAuth } from "convex/react";
+import { useAuthActions, useConvexAuth } from "./lib/convexAdapter";
 
 export function SignOutButton() {
   const { isAuthenticated } = useConvexAuth();

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useMutation, useQuery } from "convex/react";
+import { useMutation, useQuery } from "../lib/convexAdapter";
 import { api } from "../../convex/_generated/api";
 import { toast } from "sonner";
 import { LiveTrafficMap } from "./LiveTrafficMap";

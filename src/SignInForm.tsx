@@ -1,5 +1,5 @@
 "use client";
-import { useAuthActions } from "@convex-dev/auth/react";
+import { useAuthActions } from "./lib/convexAdapter";
 import { useState } from "react";
 import { toast } from "sonner";
 

@@ -1,0 +1,6 @@
+{
+  "name": "SmartRoutes",
+  "description": "AI-powered driving intelligence platform and 3D urban mobility digital twin with OSRM routing, OpenStreetMap discovery, community road reporting, emergency assistance, and Gemini multi-agent companion.",
+  "requestFramePermissions": ["geolocation", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

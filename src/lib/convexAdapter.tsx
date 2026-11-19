@@ -2,6 +2,7 @@ import React, {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -25,9 +26,16 @@ import {
   type FunctionReturnType,
   type OptionalRestArgs,
 } from "convex/server";
+import type {
+  CommunityReport,
+  FavouriteDestination,
+  SavedJourneyRecord,
+  UserPreferencesRecord,
+} from "../types/mobility";
+import { api } from "../../convex/_generated/api";
 
 const CONVEX_URL = import.meta.env.VITE_CONVEX_URL as string | undefined;
-const USE_REAL_CONVEX = Boolean(
+export const USE_REAL_CONVEX = Boolean(
   CONVEX_URL && /^https?:\/\//.test(CONVEX_URL.trim()),
 );
 
@@ -35,7 +43,19 @@ const realConvexClient = USE_REAL_CONVEX
   ? new ConvexReactClient(CONVEX_URL!.trim())
   : null;
 
-// --- In-memory local runtime when VITE_CONVEX_URL is not configured ---
+type ConvexBackendMode = "real_full" | "real_hybrid" | "local_only";
+
+function isSmartRoutesV3Function(name: string): boolean {
+  return (
+    name.startsWith("journeys:") ||
+    name.startsWith("community:") ||
+    name.startsWith("preferences:")
+  );
+}
+
+const AdapterModeContext = createContext<ConvexBackendMode>("local_only");
+
+const STORAGE_KEY = "smartroutes_v3_persisted_state";
 
 interface LocalUser {
   _id: string;
@@ -115,12 +135,16 @@ interface LocalStoreState {
   bookings: LocalBooking[];
   emergencyAlerts: LocalEmergencyAlert[];
   chatSessions: LocalChatSession[];
+  savedJourneys: SavedJourneyRecord[];
+  communityReports: CommunityReport[];
+  favourites: FavouriteDestination[];
+  preferencesByUser: Record<string, UserPreferencesRecord>;
 }
 
 const INITIAL_PARKING_SLOTS: LocalParkingSlot[] = [
   {
     _id: "parking_1",
-    name: "City Center Mall Parking",
+    name: "City Center Mall Parking (Demo Slot)",
     location: {
       lat: 40.7128,
       lng: -74.006,
@@ -134,7 +158,7 @@ const INITIAL_PARKING_SLOTS: LocalParkingSlot[] = [
   },
   {
     _id: "parking_2",
-    name: "Downtown Business District",
+    name: "Downtown Business District (Demo Slot)",
     location: {
       lat: 40.7589,
       lng: -73.9851,
@@ -147,6 +171,18 @@ const INITIAL_PARKING_SLOTS: LocalParkingSlot[] = [
     isActive: true,
   },
 ];
+
+const DEFAULT_PREFERENCES: UserPreferencesRecord = {
+  preferredRouteType: "fastest",
+  avoidTolls: false,
+  avoidHighways: false,
+  vehicleType: "car",
+  notificationsEnabled: true,
+  parkingPreference: "closest",
+  accessibilityNeeds: false,
+  emergencyContactName: "",
+  emergencyContactPhone: "",
+};
 
 const TRAFFIC_BY_CAMERA: Record<
   string,
@@ -193,8 +229,65 @@ const TRAFFIC_BY_CAMERA: Record<
   },
 };
 
+function approxDistKm(lat1: number, lng1: number, lat2: number, lng2: number) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function loadInitialState(): LocalStoreState {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<LocalStoreState>;
+      return {
+        user: parsed.user ?? null,
+        routes: Array.isArray(parsed.routes) ? parsed.routes : [],
+        parkingSlots:
+          Array.isArray(parsed.parkingSlots) && parsed.parkingSlots.length > 0
+            ? parsed.parkingSlots
+            : INITIAL_PARKING_SLOTS,
+        bookings: Array.isArray(parsed.bookings) ? parsed.bookings : [],
+        emergencyAlerts: Array.isArray(parsed.emergencyAlerts)
+          ? parsed.emergencyAlerts
+          : [],
+        chatSessions: Array.isArray(parsed.chatSessions) ? parsed.chatSessions : [],
+        savedJourneys: Array.isArray(parsed.savedJourneys)
+          ? parsed.savedJourneys
+          : [],
+        communityReports: Array.isArray(parsed.communityReports)
+          ? parsed.communityReports
+          : [],
+        favourites: Array.isArray(parsed.favourites) ? parsed.favourites : [],
+        preferencesByUser: parsed.preferencesByUser || {},
+      };
+    }
+  } catch {
+    // ignore corrupted storage
+  }
+  return {
+    user: null,
+    routes: [],
+    parkingSlots: INITIAL_PARKING_SLOTS,
+    bookings: [],
+    emergencyAlerts: [],
+    chatSessions: [],
+    savedJourneys: [],
+    communityReports: [],
+    favourites: [],
+    preferencesByUser: {},
+  };
+}
+
 interface LocalContextValue {
   state: LocalStoreState;
+  activeUser: LocalUser | null;
   signIn: (provider: string, params?: FormData | Record<string, unknown>) => Promise<void>;
   signOut: () => Promise<void>;
   runMutation: (name: string, args: Record<string, any>) => Promise<any>;
@@ -203,15 +296,39 @@ interface LocalContextValue {
 
 const LocalConvexContext = createContext<LocalContextValue | null>(null);
 
-function LocalConvexProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<LocalStoreState>({
-    user: null,
-    routes: [],
-    parkingSlots: INITIAL_PARKING_SLOTS,
-    bookings: [],
-    emergencyAlerts: [],
-    chatSessions: [],
-  });
+function LocalConvexProvider({
+  children,
+  externalUser,
+}: {
+  children: ReactNode;
+  externalUser?: LocalUser | null;
+}) {
+  const [state, setState] = useState<LocalStoreState>(() => loadInitialState());
+  const activeUser = externalUser !== undefined ? externalUser : state.user;
+
+  // Persist to localStorage so journeys, favourites, preferences, and reports survive refresh
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch {
+      // ignore quota errors
+    }
+  }, [state]);
+
+  // Cross-tab reactive synchronization
+  useEffect(() => {
+    const onStorage = (ev: StorageEvent) => {
+      if (ev.key === STORAGE_KEY && ev.newValue) {
+        try {
+          setState(JSON.parse(ev.newValue) as LocalStoreState);
+        } catch {
+          // ignore
+        }
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   const signIn = useCallback(
     async (provider: string, params?: FormData | Record<string, unknown>) => {
@@ -219,8 +336,8 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
         setState((prev) => ({
           ...prev,
           user: {
-            _id: "user_anon",
-            name: "Guest User",
+            _id: "user_guest",
+            name: "Guest Driver",
             isAnonymous: true,
           },
         }));
@@ -229,13 +346,13 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
 
       const email =
         params instanceof FormData
-          ? String(params.get("email") || "user@smarttraffic.local")
-          : String((params as Record<string, unknown>)?.email || "user@smarttraffic.local");
+          ? String(params.get("email") || "driver@smartroutes.local").trim()
+          : String((params as Record<string, unknown>)?.email || "driver@smartroutes.local").trim();
 
       setState((prev) => ({
         ...prev,
         user: {
-          _id: `user_${email}`,
+          _id: `user_${email.toLowerCase()}`,
           email,
           name: email.split("@")[0],
           isAnonymous: false,
@@ -251,6 +368,249 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
 
   const runMutation = useCallback(
     async (name: string, args: Record<string, any> = {}) => {
+      const uid = activeUser?._id;
+
+      // Saved Journeys (Workflow A & B)
+      if (name === "journeys:saveJourney") {
+        if (!uid) throw new Error("Sign in required to save journeys.");
+        const id = `journey_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const record: SavedJourneyRecord = {
+          _id: id,
+          _creationTime: Date.now(),
+          userId: uid,
+          name: args.name,
+          origin: args.origin,
+          destination: args.destination,
+          waypoints: args.waypoints || [],
+          selectedRouteId: args.selectedRouteId,
+          distanceKm: args.distanceKm,
+          durationMin: args.durationMin,
+          turnCount: args.turnCount,
+          qualityScore: args.qualityScore,
+          routeType: args.routeType,
+          geometry: args.geometry,
+          aiSummary: args.aiSummary,
+          isEmergency: args.isEmergency,
+        };
+        setState((prev) => ({
+          ...prev,
+          savedJourneys: [record, ...prev.savedJourneys],
+        }));
+        return id;
+      }
+
+      if (name === "journeys:updateJourneyStops") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => ({
+          ...prev,
+          savedJourneys: prev.savedJourneys.map((j) =>
+            j._id === args.journeyId && j.userId === uid
+              ? {
+                  ...j,
+                  waypoints: args.waypoints,
+                  distanceKm: args.distanceKm,
+                  durationMin: args.durationMin,
+                  turnCount: args.turnCount,
+                  qualityScore: args.qualityScore,
+                  geometry: args.geometry,
+                }
+              : j,
+          ),
+        }));
+        return null;
+      }
+
+      if (name === "journeys:deleteJourney") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => ({
+          ...prev,
+          savedJourneys: prev.savedJourneys.filter(
+            (j) => !(j._id === args.journeyId && j.userId === uid),
+          ),
+        }));
+        return null;
+      }
+
+      // Community Road Intelligence (Workflow C)
+      if (name === "community:submitReport") {
+        if (!uid) throw new Error("Sign in required to submit road reports.");
+        const desc = String(args.description || "").trim();
+        if (desc.length < 4) {
+          throw new Error("Please enter a brief description (at least 4 characters).");
+        }
+        const now = Date.now();
+        const recent = state.communityReports.filter(
+          (r) => r.createdBy === uid && now - r.createdAt < 10 * 60 * 1000,
+        );
+        if (recent.length >= 5) {
+          throw new Error("Rate limit reached: wait a few minutes before submitting another report.");
+        }
+
+        const duplicate = state.communityReports.find(
+          (r) =>
+            r.verificationStatus !== "resolved" &&
+            r.expiresAt > now &&
+            r.type === args.type &&
+            approxDistKm(r.lat, r.lng, args.lat, args.lng) < 0.2,
+        );
+
+        if (duplicate) {
+          setState((prev) => ({
+            ...prev,
+            communityReports: prev.communityReports.map((r) => {
+              if (r._id !== duplicate._id) return r;
+              if (r.confirmedBy.includes(uid)) return r;
+              const nextConf = r.confirmations + 1;
+              return {
+                ...r,
+                confirmations: nextConf,
+                confirmedBy: [...r.confirmedBy, uid],
+                verificationStatus: nextConf >= 2 ? "confirmed" : r.verificationStatus,
+              };
+            }),
+          }));
+          return { reportId: duplicate._id, mergedDuplicate: true };
+        }
+
+        const ttlMs = Math.min(Math.max(Number(args.ttlHours || 6), 1), 72) * 3600 * 1000;
+        const reportId = `report_${now}_${Math.random().toString(36).slice(2, 6)}`;
+        const newReport: CommunityReport = {
+          _id: reportId,
+          type: args.type,
+          lat: args.lat,
+          lng: args.lng,
+          address: args.address,
+          description: desc,
+          severity: args.severity || "moderate",
+          dataSource: "community",
+          verificationStatus: "unverified",
+          confirmations: 1,
+          confirmedBy: [uid],
+          flaggedBy: [],
+          createdBy: uid,
+          createdAt: now,
+          expiresAt: now + ttlMs,
+        };
+        setState((prev) => ({
+          ...prev,
+          communityReports: [newReport, ...prev.communityReports],
+        }));
+        return { reportId, mergedDuplicate: false };
+      }
+
+      if (name === "community:confirmReport") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => ({
+          ...prev,
+          communityReports: prev.communityReports.map((r) => {
+            if (r._id !== args.reportId || r.confirmedBy.includes(uid)) return r;
+            const nextConf = r.confirmations + 1;
+            return {
+              ...r,
+              confirmations: nextConf,
+              confirmedBy: [...r.confirmedBy, uid],
+              verificationStatus: nextConf >= 2 ? "confirmed" : r.verificationStatus,
+            };
+          }),
+        }));
+        return null;
+      }
+
+      if (name === "community:flagReport") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => ({
+          ...prev,
+          communityReports: prev.communityReports.map((r) => {
+            if (r._id !== args.reportId || r.flaggedBy.includes(uid)) return r;
+            const nextFlagged = [...r.flaggedBy, uid];
+            return {
+              ...r,
+              flaggedBy: nextFlagged,
+              verificationStatus:
+                nextFlagged.length >= 2 ? "flagged" : r.verificationStatus,
+            };
+          }),
+        }));
+        return null;
+      }
+
+      if (name === "community:resolveReport") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => ({
+          ...prev,
+          communityReports: prev.communityReports.map((r) =>
+            r._id === args.reportId && r.createdBy === uid
+              ? { ...r, verificationStatus: "resolved" }
+              : r,
+          ),
+        }));
+        return null;
+      }
+
+      // Personalization & Favourites (Workflow F)
+      if (name === "preferences:savePreferences") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => ({
+          ...prev,
+          preferencesByUser: {
+            ...prev.preferencesByUser,
+            [uid]: {
+              ...DEFAULT_PREFERENCES,
+              ...(args as Partial<UserPreferencesRecord>),
+            },
+          },
+        }));
+        return `pref_${uid}`;
+      }
+
+      if (name === "preferences:addFavourite") {
+        if (!uid) throw new Error("Not authenticated");
+        const favId = `fav_${Date.now()}`;
+        const fav: FavouriteDestination = {
+          _id: favId,
+          userId: uid,
+          label: String(args.label || "").trim(),
+          address: args.address,
+          lat: args.lat,
+          lng: args.lng,
+          category: args.category || "frequent",
+          createdAt: Date.now(),
+        };
+        setState((prev) => ({
+          ...prev,
+          favourites: [fav, ...prev.favourites],
+        }));
+        return favId;
+      }
+
+      if (name === "preferences:removeFavourite") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => ({
+          ...prev,
+          favourites: prev.favourites.filter(
+            (f) => !(f._id === args.favouriteId && f.userId === uid),
+          ),
+        }));
+        return null;
+      }
+
+      if (name === "preferences:deleteAllPersonalData") {
+        if (!uid) throw new Error("Not authenticated");
+        setState((prev) => {
+          const nextPrefs = { ...prev.preferencesByUser };
+          delete nextPrefs[uid];
+          return {
+            ...prev,
+            savedJourneys: prev.savedJourneys.filter((j) => j.userId !== uid),
+            favourites: prev.favourites.filter((f) => f.userId !== uid),
+            chatSessions: prev.chatSessions.filter((c) => c.userId !== uid),
+            preferencesByUser: nextPrefs,
+          };
+        });
+        return null;
+      }
+
+      // Preserved original Smart Traffic mutations
       if (name === "parking:initializeParkingData") {
         setState((prev) =>
           prev.parkingSlots.length > 0
@@ -265,7 +625,7 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
         const newRoute: LocalRoute = {
           _id: id,
           _creationTime: Date.now(),
-          userId: state.user?._id || "user_anon",
+          userId: uid || "user_guest",
           startLocation: args.startLocation,
           endLocation: args.endLocation,
           routeOptions: [
@@ -279,28 +639,6 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
                 { lat: args.endLocation.lat, lng: args.endLocation.lng },
               ],
               isRecommended: true,
-            },
-            {
-              routeId: "route_2",
-              distance: 18.7,
-              estimatedTime: 22,
-              trafficLevel: "medium",
-              waypoints: [
-                { lat: args.startLocation.lat, lng: args.startLocation.lng },
-                { lat: args.endLocation.lat, lng: args.endLocation.lng },
-              ],
-              isRecommended: false,
-            },
-            {
-              routeId: "route_3",
-              distance: 12.8,
-              estimatedTime: 35,
-              trafficLevel: "high",
-              waypoints: [
-                { lat: args.startLocation.lat, lng: args.startLocation.lng },
-                { lat: args.endLocation.lat, lng: args.endLocation.lng },
-              ],
-              isRecommended: false,
             },
           ],
           status: "planning",
@@ -319,7 +657,7 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
           const hours = (args.endTime - args.startTime) / (1000 * 60 * 60);
           const booking: LocalBooking = {
             _id: bookingId,
-            userId: prev.user?._id || "user_anon",
+            userId: uid || "user_guest",
             parkingSlotId: args.parkingSlotId,
             startTime: args.startTime,
             endTime: args.endTime,
@@ -383,7 +721,7 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
       }
 
       if (name === "chat:sendMessage") {
-        const userId = state.user?._id || "user_anon";
+        const userId = uid || "user_guest";
         let resolvedSessionId = `session_${userId}`;
         setState((prev) => {
           const existing = prev.chatSessions.find(
@@ -445,50 +783,35 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
 
       return null;
     },
-    [state.user],
+    [state.communityReports, activeUser],
   );
 
   const runAction = useCallback(
     async (name: string, args: Record<string, any> = {}) => {
-      const prompt = String(args.message || "").toLowerCase();
-      let reply =
-        "I can help you optimize routes, check available parking, monitor traffic cameras, or manage emergency corridors. What would you like to do? 🗺️";
-
-      if (prompt.includes("parking")) {
-        const totalAvail = state.parkingSlots.reduce(
-          (sum, s) => sum + s.availableSlots,
-          0,
-        );
-        reply = `There are currently ${totalAvail} parking spots available across ${state.parkingSlots.length} nearby locations. City Center Mall Parking ($5/hr) has the most availability right now. 🅿️`;
-      } else if (prompt.includes("route") || prompt.includes("fastest") || prompt.includes("fuel") || prompt.includes("eco")) {
-        reply =
-          "Route 1 is currently recommended with low congestion (~25 min, 15.2 km). You can also switch to Eco-Friendly mode in the AI Route Optimizer tab to minimize fuel usage. 🚀";
-      } else if (prompt.includes("emergency") || prompt.includes("ambulance")) {
-        const activeCount = state.emergencyAlerts.filter((a) => a.isActive).length;
-        reply =
-          activeCount > 0
-            ? `There ${activeCount === 1 ? "is" : "are"} currently ${activeCount} active emergency corridor alert${activeCount === 1 ? "" : "s"}. Please keep the rightmost lane clear. 🚨`
-            : "There are no active emergency corridor alerts right now. You can activate one anytime in the Emergency Alerts tab. ✅";
-      } else if (prompt.includes("traffic") || prompt.includes("time")) {
-        reply =
-          "Current corridor congestion is moderate (~60%). Highway 101 North is flowing smoothly at ~62 km/h while Downtown Bridge has heavier delays. 🚦";
-      }
-
-      if (name === "chat:generateBotResponse" && args.sessionId) {
-        await runMutation("chat:addBotResponse", {
-          sessionId: args.sessionId,
-          response: reply,
+      if (name === "aiChatbot:generateIntelligentResponse" || name === "chat:generateBotResponse") {
+        const res = await fetch("/api/ai/companion", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: args.message, context: args.context || {} }),
         });
+        const data = await res.json();
+        const text = data.reply || data.error || "AI service unavailable.";
+        if (name === "chat:generateBotResponse" && args.sessionId) {
+          await runMutation("chat:addBotResponse", {
+            sessionId: args.sessionId,
+            response: text,
+          });
+        }
+        return text;
       }
-
-      return reply;
+      return null;
     },
-    [runMutation, state.emergencyAlerts, state.parkingSlots],
+    [runMutation],
   );
 
   const value = useMemo(
-    () => ({ state, signIn, signOut, runMutation, runAction }),
-    [state, signIn, signOut, runMutation, runAction],
+    () => ({ state, activeUser, signIn, signOut, runMutation, runAction }),
+    [state, activeUser, signIn, signOut, runMutation, runAction],
   );
 
   return (
@@ -498,35 +821,127 @@ function LocalConvexProvider({ children }: { children: ReactNode }) {
   );
 }
 
+function HybridLocalBridge({ children }: { children: ReactNode }) {
+  const realUser = useRealQuery(api.auth.loggedInUser);
+  const externalUser: LocalUser | null = realUser
+    ? {
+        _id: String((realUser as any)._id),
+        email: (realUser as any).email,
+        name: (realUser as any).name || (realUser as any).email || "Driver",
+        isAnonymous: Boolean((realUser as any).isAnonymous),
+      }
+    : null;
+  return (
+    <LocalConvexProvider externalUser={externalUser}>
+      {children}
+    </LocalConvexProvider>
+  );
+}
+
 export function AppConvexProvider({ children }: { children: ReactNode }) {
-  if (USE_REAL_CONVEX && realConvexClient) {
+  const [mode, setMode] = useState<ConvexBackendMode | null>(() =>
+    USE_REAL_CONVEX && realConvexClient ? null : "local_only",
+  );
+
+  useEffect(() => {
+    if (!USE_REAL_CONVEX || !realConvexClient || !CONVEX_URL) return;
+    let cancelled = false;
+    const base = CONVEX_URL.trim().replace(/\/$/, "");
+
+    (async () => {
+      try {
+        const res = await fetch(`${base}/api/query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            path: "journeys:listUserJourneys",
+            args: {},
+            format: "json",
+          }),
+          signal: AbortSignal.timeout(4000),
+        });
+        const data = await res.json();
+        if (!cancelled) {
+          if (res.ok && data?.status === "success") {
+            setMode("real_full");
+          } else {
+            console.info(
+              `[SmartRoutes] Convex deployment (${base}) does not yet have SmartRoutes 3.0 functions deployed; activating hybrid mode (real Convex Auth + persistent local store for journeys/community/preferences).`,
+            );
+            setMode("real_hybrid");
+          }
+        }
+      } catch {
+        if (!cancelled) setMode("real_hybrid");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (mode === null) {
     return (
-      <ConvexAuthProvider client={realConvexClient}>
-        {children}
-      </ConvexAuthProvider>
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950">
+        <div className="flex flex-col items-center gap-3">
+          <div className="animate-spin rounded-full h-9 w-9 border-2 border-slate-300 dark:border-slate-700 border-t-blue-600" />
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Connecting to SmartRoutes backend...
+          </p>
+        </div>
+      </div>
     );
   }
-  return <LocalConvexProvider>{children}</LocalConvexProvider>;
+
+  if (mode === "real_full" && realConvexClient) {
+    return (
+      <AdapterModeContext.Provider value="real_full">
+        <ConvexAuthProvider client={realConvexClient}>
+          {children}
+        </ConvexAuthProvider>
+      </AdapterModeContext.Provider>
+    );
+  }
+
+  if (mode === "real_hybrid" && realConvexClient) {
+    return (
+      <AdapterModeContext.Provider value="real_hybrid">
+        <ConvexAuthProvider client={realConvexClient}>
+          <HybridLocalBridge>{children}</HybridLocalBridge>
+        </ConvexAuthProvider>
+      </AdapterModeContext.Provider>
+    );
+  }
+
+  return (
+    <AdapterModeContext.Provider value="local_only">
+      <LocalConvexProvider>{children}</LocalConvexProvider>
+    </AdapterModeContext.Provider>
+  );
 }
 
 export function Authenticated({ children }: { children: ReactNode }) {
-  if (USE_REAL_CONVEX) {
+  const mode = useContext(AdapterModeContext);
+  if (mode !== "local_only") {
     return <RealAuthenticated>{children}</RealAuthenticated>;
   }
   const ctx = useContext(LocalConvexContext);
-  return ctx?.state.user ? <>{children}</> : null;
+  return ctx?.activeUser ? <>{children}</> : null;
 }
 
 export function Unauthenticated({ children }: { children: ReactNode }) {
-  if (USE_REAL_CONVEX) {
+  const mode = useContext(AdapterModeContext);
+  if (mode !== "local_only") {
     return <RealUnauthenticated>{children}</RealUnauthenticated>;
   }
   const ctx = useContext(LocalConvexContext);
-  return !ctx?.state.user ? <>{children}</> : null;
+  return !ctx?.activeUser ? <>{children}</> : null;
 }
 
 export function useConvexAuth() {
-  if (USE_REAL_CONVEX) {
+  const mode = useContext(AdapterModeContext);
+  if (mode !== "local_only") {
     // eslint-disable-next-line react-hooks/rules-of-hooks
     return useRealConvexAuth();
   }
@@ -534,12 +949,13 @@ export function useConvexAuth() {
   const ctx = useContext(LocalConvexContext);
   return {
     isLoading: false,
-    isAuthenticated: Boolean(ctx?.state.user),
+    isAuthenticated: Boolean(ctx?.activeUser),
   };
 }
 
 export function useAuthActions() {
-  if (USE_REAL_CONVEX) {
+  const mode = useContext(AdapterModeContext);
+  if (mode !== "local_only") {
     // eslint-disable-next-line react-hooks/rules-of-hooks
     return useRealAuthActions();
   }
@@ -560,7 +976,13 @@ export function useQuery<Query extends FunctionReference<"query">>(
   query: Query,
   ...args: OptionalRestArgs<Query> | ["skip"]
 ): FunctionReturnType<Query> | undefined {
-  if (USE_REAL_CONVEX) {
+  const mode = useContext(AdapterModeContext);
+  const name = getFunctionName(query);
+  const useReal =
+    mode === "real_full" ||
+    (mode === "real_hybrid" && !isSmartRoutesV3Function(name));
+
+  if (useReal) {
     // eslint-disable-next-line react-hooks/rules-of-hooks
     return useRealQuery(query, ...(args as any));
   }
@@ -570,21 +992,31 @@ export function useQuery<Query extends FunctionReference<"query">>(
     return undefined;
   }
 
-  const name = getFunctionName(query);
   const queryArgs = (args[0] || {}) as Record<string, any>;
-  const { state } = ctx;
+  const { state, activeUser } = ctx;
+  const uid = activeUser?._id;
 
   switch (name) {
     case "auth:loggedInUser":
-      return state.user as any;
+      return activeUser as any;
+    case "journeys:listUserJourneys":
+      return (uid ? state.savedJourneys.filter((j) => j.userId === uid) : []) as any;
+    case "community:listActiveReports":
+      return state.communityReports.filter(
+        (r) => r.verificationStatus !== "resolved" && r.expiresAt > Date.now(),
+      ) as any;
+    case "preferences:getPreferences":
+      return (uid ? state.preferencesByUser[uid] || null : null) as any;
+    case "preferences:listFavourites":
+      return (uid ? state.favourites.filter((f) => f.userId === uid) : []) as any;
     case "routes:getUserRoutes":
-      return state.routes as any;
+      return (uid ? state.routes.filter((r) => r.userId === uid) : []) as any;
     case "routes:getTrafficData":
       return (TRAFFIC_BY_CAMERA[queryArgs.routeSegment] || null) as any;
     case "parking:getParkingSlots":
       return state.parkingSlots.filter((s) => s.isActive) as any;
     case "parking:getUserBookings":
-      return state.bookings.map((b) => ({
+      return (uid ? state.bookings.filter((b) => b.userId === uid) : []).map((b) => ({
         ...b,
         parkingSlot:
           state.parkingSlots.find((s) => s._id === b.parkingSlotId) || null,
@@ -592,11 +1024,9 @@ export function useQuery<Query extends FunctionReference<"query">>(
     case "emergency:getActiveEmergencyAlerts":
       return state.emergencyAlerts.filter((a) => a.isActive) as any;
     case "chat:getChatSession": {
-      const userId = state.user?._id;
-      if (!userId) return null as any;
+      if (!uid) return null as any;
       return (
-        state.chatSessions.find((s) => s.userId === userId && s.isActive) ||
-        null
+        state.chatSessions.find((s) => s.userId === uid && s.isActive) || null
       ) as any;
     }
     default:
@@ -609,13 +1039,18 @@ export function useMutation<Mutation extends FunctionReference<"mutation">>(
 ): (
   ...args: OptionalRestArgs<Mutation>
 ) => Promise<FunctionReturnType<Mutation>> {
-  if (USE_REAL_CONVEX) {
+  const mode = useContext(AdapterModeContext);
+  const name = getFunctionName(mutation);
+  const useReal =
+    mode === "real_full" ||
+    (mode === "real_hybrid" && !isSmartRoutesV3Function(name));
+
+  if (useReal) {
     // eslint-disable-next-line react-hooks/rules-of-hooks
     return useRealMutation(mutation) as any;
   }
   // eslint-disable-next-line react-hooks/rules-of-hooks
   const ctx = useContext(LocalConvexContext);
-  const name = getFunctionName(mutation);
   // eslint-disable-next-line react-hooks/rules-of-hooks
   return useCallback(
     async (...args: any[]) => {
@@ -629,13 +1064,18 @@ export function useMutation<Mutation extends FunctionReference<"mutation">>(
 export function useAction<Action extends FunctionReference<"action">>(
   action: Action,
 ): (...args: OptionalRestArgs<Action>) => Promise<FunctionReturnType<Action>> {
-  if (USE_REAL_CONVEX) {
+  const mode = useContext(AdapterModeContext);
+  const name = getFunctionName(action);
+  const useReal =
+    mode === "real_full" ||
+    (mode === "real_hybrid" && !isSmartRoutesV3Function(name));
+
+  if (useReal) {
     // eslint-disable-next-line react-hooks/rules-of-hooks
     return useRealAction(action) as any;
   }
   // eslint-disable-next-line react-hooks/rules-of-hooks
   const ctx = useContext(LocalConvexContext);
-  const name = getFunctionName(action);
   // eslint-disable-next-line react-hooks/rules-of-hooks
   return useCallback(
     async (...args: any[]) => {

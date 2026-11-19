@@ -1,0 +1,883 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import {
+  BarChart3,
+  Compass,
+  Moon,
+  ParkingSquare,
+  ShieldAlert,
+  Siren,
+  Sparkles,
+  Sun,
+} from "lucide-react";
+import { toast } from "sonner";
+import { useMutation, useQuery } from "../lib/convexAdapter";
+import { api } from "../../convex/_generated/api";
+import { SignOutButton } from "../SignOutButton";
+import {
+  apiCalculateRoute,
+  apiDiscoverPOIs,
+  apiFetchUrbanContext,
+  apiFetchWeather,
+  apiReverseGeocode,
+} from "../services/apiClient";
+import type {
+  CommunityReport,
+  CompanionMapAction,
+  DiscoveredPOI,
+  FavouriteDestination,
+  GeoPoint,
+  JourneyStop,
+  PredictiveRouteResult,
+  RoutePreferences,
+  SavedJourneyRecord,
+  UrbanContextData,
+  UserPreferencesRecord,
+  WeatherSnapshot,
+} from "../types/mobility";
+import { MapViewport, type MapViewMode } from "./map/MapViewport";
+import { RoutePlannerPanel } from "./panels/RoutePlannerPanel";
+import { StopsAndParkingPanel } from "./panels/StopsAndParkingPanel";
+import { SafetyAndCommunityPanel } from "./panels/SafetyAndCommunityPanel";
+import { EmergencyPanel } from "./panels/EmergencyPanel";
+import { InsightsAndProfilePanel } from "./panels/InsightsAndProfilePanel";
+import { DrivingCompanionDrawer } from "./ai/DrivingCompanionDrawer";
+
+interface CommandCenterProps {
+  theme: "light" | "dark";
+  onToggleTheme: () => void;
+}
+
+const DEFAULT_FALLBACK_CENTER = { lat: 40.7549, lng: -73.984 };
+
+export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
+  const navigate = useNavigate();
+
+  // Persistent Queries (Convex or localStorage-persisted adapter)
+  const loggedInUser = useQuery(api.auth.loggedInUser);
+  const savedJourneys = (useQuery(api.journeys.listUserJourneys) || []) as unknown as SavedJourneyRecord[];
+  const communityReports = (useQuery(api.community.listActiveReports) || []) as unknown as CommunityReport[];
+  const savedPreferences = useQuery(api.preferences.getPreferences) as UserPreferencesRecord | null | undefined;
+  const favourites = (useQuery(api.preferences.listFavourites) || []) as unknown as FavouriteDestination[];
+
+  // Persistent Mutations
+  const initializeParking = useMutation(api.parking.initializeParkingData);
+  const saveJourneyMutation = useMutation(api.journeys.saveJourney);
+  const updateJourneyStopsMutation = useMutation(api.journeys.updateJourneyStops);
+  const deleteJourneyMutation = useMutation(api.journeys.deleteJourney);
+  const submitReportMutation = useMutation(api.community.submitReport);
+  const confirmReportMutation = useMutation(api.community.confirmReport);
+  const flagReportMutation = useMutation(api.community.flagReport);
+  const resolveReportMutation = useMutation(api.community.resolveReport);
+  const savePreferencesMutation = useMutation(api.preferences.savePreferences);
+  const addFavouriteMutation = useMutation(api.preferences.addFavourite);
+  const removeFavouriteMutation = useMutation(api.preferences.removeFavourite);
+  const deleteAllPersonalDataMutation = useMutation(api.preferences.deleteAllPersonalData);
+
+  // Synchronized Mobility State
+  const [origin, setOrigin] = useState<GeoPoint | null>(null);
+  const [destination, setDestination] = useState<GeoPoint | null>(null);
+  const [waypoints, setWaypoints] = useState<JourneyStop[]>([]);
+  const [activeSavedJourneyId, setActiveSavedJourneyId] = useState<string | null>(null);
+  const [preferences, setPreferences] = useState<RoutePreferences>({
+    routeType: "fastest",
+    avoidTolls: false,
+    avoidHighways: false,
+    optimizeStopOrder: false,
+  });
+
+  const [routeResult, setRouteResult] = useState<PredictiveRouteResult | null>(null);
+  const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const [isCalculatingRoute, setIsCalculatingRoute] = useState(false);
+
+  const [discoveredPOIs, setDiscoveredPOIs] = useState<DiscoveredPOI[]>([]);
+  const [emergencyPOIs, setEmergencyPOIs] = useState<DiscoveredPOI[]>([]);
+  const [isSearchingPOIs, setIsSearchingPOIs] = useState(false);
+  const [isSearchingEmergency, setIsSearchingEmergency] = useState(false);
+
+  const [urbanContext, setUrbanContext] = useState<UrbanContextData | null>(null);
+  const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
+  const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
+
+  // Viewport & Interaction State
+  const [viewMode, setViewMode] = useState<MapViewMode>("2d");
+  const [nightScene3D, setNightScene3D] = useState<boolean>(theme === "dark");
+  const [mapPickMode, setMapPickMode] = useState<"none" | "origin" | "destination" | "report">("none");
+  const [selectedReportLocation, setSelectedReportLocation] = useState<GeoPoint | null>(null);
+  const [focusPoint, setFocusPoint] = useState<{ lat: number; lng: number } | null>(null);
+
+  // AI Driving Companion Drawer State
+  const [companionOpen, setCompanionOpen] = useState(false);
+  const [pendingAIPrompt, setPendingAIPrompt] = useState<string | null>(null);
+
+  const prefsAppliedRef = useRef(false);
+
+  // Keep demo parking slots initialized idempotently
+  useEffect(() => {
+    void initializeParking().catch(() => {});
+  }, [initializeParking]);
+
+  // Apply persisted user route preferences when loaded
+  useEffect(() => {
+    if (savedPreferences && !prefsAppliedRef.current) {
+      prefsAppliedRef.current = true;
+      setPreferences((prev) => ({
+        ...prev,
+        routeType: savedPreferences.preferredRouteType || prev.routeType,
+        avoidTolls: Boolean(savedPreferences.avoidTolls),
+        avoidHighways: Boolean(savedPreferences.avoidHighways),
+      }));
+    }
+  }, [savedPreferences]);
+
+  // Keep 3D sky synchronized when user flips global theme
+  useEffect(() => {
+    setNightScene3D(theme === "dark");
+  }, [theme]);
+
+  // Fetch real OSM 3D urban context & Open-Meteo weather whenever active route changes
+  useEffect(() => {
+    const anchor = routeResult
+      ? {
+          lat: (routeResult.origin.lat + routeResult.destination.lat) / 2,
+          lng: (routeResult.origin.lng + routeResult.destination.lng) / 2,
+        }
+      : userLocation || DEFAULT_FALLBACK_CENTER;
+
+    const weatherAnchor = routeResult
+      ? routeResult.destination
+      : userLocation || DEFAULT_FALLBACK_CENTER;
+
+    let cancelled = false;
+    void apiFetchWeather(weatherAnchor.lat, weatherAnchor.lng)
+      .then((snap) => {
+        if (!cancelled) setWeather(snap);
+      })
+      .catch(() => {});
+
+    if (routeResult) {
+      void apiFetchUrbanContext(anchor.lat, anchor.lng, 650)
+        .then((ctx) => {
+          if (!cancelled) setUrbanContext(ctx);
+        })
+        .catch(() => {});
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [routeResult, userLocation]);
+
+  // Combine standard + emergency POIs for synchronized map rendering
+  const visibleMapPOIs = useMemo(() => {
+    const map = new Map<string, DiscoveredPOI>();
+    for (const p of discoveredPOIs) map.set(p.id, p);
+    for (const p of emergencyPOIs) map.set(p.id, p);
+    return Array.from(map.values());
+  }, [discoveredPOIs, emergencyPOIs]);
+
+  const runRouteCalculation = useCallback(
+    async (
+      nextOrigin: GeoPoint,
+      nextDestination: GeoPoint,
+      nextWaypoints: JourneyStop[],
+      nextPrefs: RoutePreferences,
+      isEmergency = false,
+      persistToJourneyId?: string | null,
+    ) => {
+      setIsCalculatingRoute(true);
+      try {
+        const result = await apiCalculateRoute({
+          origin: nextOrigin,
+          destination: nextDestination,
+          waypoints: nextWaypoints,
+          preferences: nextPrefs,
+          isEmergency,
+        });
+        setRouteResult(result);
+        setSelectedRouteId(result.recommendedRouteId);
+
+        const chosen =
+          result.alternatives.find((a) => a.routeId === result.recommendedRouteId) ||
+          result.alternatives[0];
+
+        if (persistToJourneyId && chosen) {
+          await updateJourneyStopsMutation({
+            journeyId: persistToJourneyId as any,
+            waypoints: result.waypoints,
+            distanceKm: chosen.distanceKm,
+            durationMin: chosen.durationMin,
+            turnCount: chosen.turns.maneuverCount,
+            qualityScore: chosen.qualityScore,
+            geometry: chosen.geometry,
+          });
+        }
+
+        toast.success(
+          isEmergency
+            ? `Emergency route ready (${chosen.distanceKm} km, ~${chosen.durationMin} min).`
+            : `Calculated ${result.alternatives.length} route option(s) via OSRM.`,
+        );
+      } catch (err: any) {
+        toast.error(err?.message || "Could not calculate driving route.");
+      } finally {
+        setIsCalculatingRoute(false);
+      }
+    },
+    [updateJourneyStopsMutation],
+  );
+
+  // Workflow A: Calculate route from current planner state
+  const handleCalculateRoute = () => {
+    if (!origin || !destination) {
+      toast.error("Choose both an origin and a destination first.");
+      return;
+    }
+    void runRouteCalculation(origin, destination, waypoints, preferences, false, activeSavedJourneyId);
+  };
+
+  // Workflow A: Save current journey
+  const handleSaveJourney = async () => {
+    if (!routeResult) return;
+    const chosen =
+      routeResult.alternatives.find((a) => a.routeId === selectedRouteId) ||
+      routeResult.alternatives[0];
+    if (!chosen) return;
+
+    const originName = routeResult.origin.label || routeResult.origin.address.split(",")[0];
+    const destName = routeResult.destination.label || routeResult.destination.address.split(",")[0];
+    const name = `${originName} → ${destName}`;
+
+    try {
+      const id = await saveJourneyMutation({
+        name,
+        origin: routeResult.origin,
+        destination: routeResult.destination,
+        waypoints: routeResult.waypoints,
+        selectedRouteId: chosen.routeId,
+        distanceKm: chosen.distanceKm,
+        durationMin: chosen.durationMin,
+        turnCount: chosen.turns.maneuverCount,
+        qualityScore: chosen.qualityScore,
+        routeType: preferences.routeType,
+        geometry: chosen.geometry,
+        aiSummary: chosen.explanation,
+        isEmergency: routeResult.isEmergency,
+      });
+      setActiveSavedJourneyId(String(id));
+      toast.success(`Saved journey: ${name}`);
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to save journey.");
+    }
+  };
+
+  // Workflow A: Reload saved journey onto both 2D & 3D
+  const handleLoadSavedJourney = (journey: SavedJourneyRecord) => {
+    setOrigin(journey.origin);
+    setDestination(journey.destination);
+    setWaypoints(journey.waypoints || []);
+    setActiveSavedJourneyId(journey._id);
+
+    const synthetic: PredictiveRouteResult = {
+      origin: journey.origin,
+      destination: journey.destination,
+      waypoints: journey.waypoints || [],
+      recommendedRouteId: journey.selectedRouteId || "saved_route",
+      predictionConfidence: "Moderate",
+      confidenceReason:
+        "Loaded saved OSRM route geometry. Click Calculate & Sync Route to refresh alternatives.",
+      provider: "Saved OSRM Journey",
+      calculatedAt: journey._creationTime,
+      isEmergency: journey.isEmergency,
+      alternatives: [
+        {
+          routeId: journey.selectedRouteId || "saved_route",
+          label: journey.name,
+          distanceKm: journey.distanceKm,
+          durationMin: journey.durationMin,
+          estimatedAvgSpeedKmh:
+            journey.durationMin > 0
+              ? Number((journey.distanceKm / (journey.durationMin / 60)).toFixed(1))
+              : 0,
+          geometry: journey.geometry,
+          turns: {
+            totalSteps: journey.turnCount,
+            maneuverCount: journey.turnCount,
+            sharpTurns: 0,
+            roundabouts: 0,
+            mergesAndRamps: 0,
+            complexityScore: Math.min(100, journey.turnCount * 3),
+            complexityLabel:
+              journey.turnCount <= 8
+                ? "Low"
+                : journey.turnCount <= 18
+                  ? "Moderate"
+                  : "High",
+            roadSummary: [],
+          },
+          qualityScore: journey.qualityScore,
+          scoreBreakdown: {
+            timeEfficiency: journey.qualityScore,
+            distanceEfficiency: journey.qualityScore,
+            turnSimplicity: journey.qualityScore,
+          },
+          tags: [journey.routeType || "Saved"],
+          explanation:
+            journey.aiSummary ||
+            "Saved journey restored onto 2D OpenStreetMap and 3D Urban Digital Twin.",
+          isRecommended: true,
+          isFastest: true,
+          isShortest: true,
+          isLowestComplexity: true,
+          timingDisclaimer:
+            "Stored OSRM road-graph estimate. Live traffic is not included.",
+        },
+      ],
+    };
+
+    setRouteResult(synthetic);
+    setSelectedRouteId(synthetic.recommendedRouteId);
+    toast.success(`Loaded saved journey: ${journey.name}`);
+  };
+
+  const handleDeleteSavedJourney = async (id: string) => {
+    try {
+      await deleteJourneyMutation({ journeyId: id as any });
+      if (activeSavedJourneyId === id) setActiveSavedJourneyId(null);
+      toast.success("Saved journey removed.");
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to delete journey.");
+    }
+  };
+
+  // Current geolocation helper
+  const handleUseCurrentLocation = () => {
+    if (!navigator.geolocation) {
+      toast.error("Browser geolocation is unavailable.");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setUserLocation({ lat, lng });
+        try {
+          const point = await apiReverseGeocode(lat, lng);
+          setOrigin(point);
+          setFocusPoint({ lat, lng });
+          toast.success(`Origin set to ${point.label || point.address}`);
+        } catch {
+          setOrigin({ lat, lng, address: `${lat.toFixed(4)}, ${lng.toFixed(4)}`, label: "Current Location" });
+        }
+      },
+      () => {
+        toast.error("Location permission denied. Search an address or pick on the map.");
+      },
+    );
+  };
+
+  // Workflow B: Discover real OSM parking/EV/fuel/rest stops
+  const handleDiscoverPOIs = async (
+    category: string,
+    anchor: "destination" | "midpoint" | "origin",
+  ) => {
+    let target = userLocation || DEFAULT_FALLBACK_CENTER;
+    if (routeResult) {
+      if (anchor === "origin") target = routeResult.origin;
+      else if (anchor === "destination") target = routeResult.destination;
+      else {
+        const activeAlt =
+          routeResult.alternatives.find((a) => a.routeId === selectedRouteId) ||
+          routeResult.alternatives[0];
+        if (activeAlt && activeAlt.geometry.length > 0) {
+          const mid = activeAlt.geometry[Math.floor(activeAlt.geometry.length / 2)];
+          target = { lat: mid[0], lng: mid[1] };
+        } else {
+          target = {
+            lat: (routeResult.origin.lat + routeResult.destination.lat) / 2,
+            lng: (routeResult.origin.lng + routeResult.destination.lng) / 2,
+          };
+        }
+      }
+    } else if (destination) {
+      target = destination;
+    } else if (origin) {
+      target = origin;
+    }
+
+    setIsSearchingPOIs(true);
+    try {
+      const pois = await apiDiscoverPOIs({
+        lat: target.lat,
+        lng: target.lng,
+        category,
+        radiusMeters: 3500,
+        limit: 12,
+      });
+      setDiscoveredPOIs(pois);
+      setFocusPoint({ lat: target.lat, lng: target.lng });
+      if (pois.length === 0) {
+        toast.info(`No OpenStreetMap ${category} stops found within 3.5 km.`);
+      } else {
+        toast.success(`Found ${pois.length} real OpenStreetMap ${category} stop(s).`);
+      }
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to query OpenStreetMap stops.");
+    } finally {
+      setIsSearchingPOIs(false);
+    }
+  };
+
+  // Workflow B: Add stop to journey, recalculate OSRM, sync 2D/3D, update saved journey if active
+  const handleAddPOIToRoute = (poi: DiscoveredPOI) => {
+    const newStop: JourneyStop = {
+      id: `stop_${poi.id}_${Date.now()}`,
+      lat: poi.lat,
+      lng: poi.lng,
+      address: poi.address,
+      label: poi.name,
+      category:
+        poi.category === "hospital" || poi.category === "police" || poi.category === "fire"
+          ? "emergency"
+          : poi.category,
+      source: "osm",
+    };
+
+    const nextWaypoints = [...waypoints, newStop];
+    setWaypoints(nextWaypoints);
+
+    const effOrigin = origin || routeResult?.origin;
+    const effDest = destination || routeResult?.destination;
+
+    if (effOrigin && effDest) {
+      void runRouteCalculation(
+        effOrigin,
+        effDest,
+        nextWaypoints,
+        preferences,
+        false,
+        activeSavedJourneyId,
+      );
+    } else {
+      setDestination({
+        lat: poi.lat,
+        lng: poi.lng,
+        address: poi.address,
+        label: poi.name,
+      });
+      toast.info(`Added ${poi.name}. Set an origin & destination to calculate the full route.`);
+    }
+  };
+
+  const handleRemoveWaypoint = (id: string) => {
+    const next = waypoints.filter((w) => w.id !== id);
+    setWaypoints(next);
+    if (origin && destination && routeResult) {
+      void runRouteCalculation(origin, destination, next, preferences, false, activeSavedJourneyId);
+    }
+  };
+
+  // Map click handler for Origin, Destination, or Community Road Report coordinates
+  const handleMapClick = async (lat: number, lng: number) => {
+    const mode = mapPickMode;
+    setMapPickMode("none");
+    if (mode === "none") return;
+
+    let point: GeoPoint = {
+      lat,
+      lng,
+      address: `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
+      label: "Map Selection",
+    };
+    try {
+      point = await apiReverseGeocode(lat, lng);
+    } catch {
+      // keep coordinates fallback
+    }
+
+    if (mode === "origin") {
+      setOrigin(point);
+      toast.success(`Origin set: ${point.label || point.address}`);
+    } else if (mode === "destination") {
+      setDestination(point);
+      toast.success(`Destination set: ${point.label || point.address}`);
+    } else if (mode === "report") {
+      setSelectedReportLocation(point);
+      toast.success(`Report coordinates picked: ${point.label || point.address}`);
+    }
+  };
+
+  // Workflow C: Community Road Reporting
+  const handleSubmitCommunityReport = async (payload: {
+    type: CommunityReport["type"];
+    lat: number;
+    lng: number;
+    address: string;
+    description: string;
+    severity: CommunityReport["severity"];
+    ttlHours: number;
+  }) => {
+    try {
+      const res = await submitReportMutation(payload);
+      setSelectedReportLocation(null);
+      setFocusPoint({ lat: payload.lat, lng: payload.lng });
+      if (res && (res as any).mergedDuplicate) {
+        toast.info("Matched an existing nearby report and incremented its confirmation count.");
+      } else {
+        toast.success("Community road report published and synced to 2D/3D views.");
+      }
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to publish report.");
+    }
+  };
+
+  // Workflow D: Emergency Facility Discovery & Routing
+  const handleDiscoverEmergency = async (category: "hospital" | "police" | "emergency") => {
+    const anchor =
+      userLocation ||
+      routeResult?.origin ||
+      origin ||
+      DEFAULT_FALLBACK_CENTER;
+
+    setIsSearchingEmergency(true);
+    try {
+      const pois = await apiDiscoverPOIs({
+        lat: anchor.lat,
+        lng: anchor.lng,
+        category,
+        radiusMeters: 6000,
+        limit: 10,
+      });
+      setEmergencyPOIs(pois);
+      setFocusPoint({ lat: anchor.lat, lng: anchor.lng });
+      if (pois.length === 0) {
+        toast.info("No matching OpenStreetMap emergency facilities found within 6 km.");
+      } else {
+        toast.success(`Found ${pois.length} nearby emergency facility(ies).`);
+      }
+    } catch (err: any) {
+      toast.error(err?.message || "Emergency service lookup failed.");
+    } finally {
+      setIsSearchingEmergency(false);
+    }
+  };
+
+  const handleRouteToEmergencyFacility = (poi: DiscoveredPOI) => {
+    const start: GeoPoint = origin ||
+      routeResult?.origin || {
+        lat: (userLocation || DEFAULT_FALLBACK_CENTER).lat,
+        lng: (userLocation || DEFAULT_FALLBACK_CENTER).lng,
+        address: userLocation ? "Current Driver Location" : "Midtown Manhattan (Default Origin)",
+        label: userLocation ? "Current Location" : "Start",
+      };
+    const dest: GeoPoint = {
+      lat: poi.lat,
+      lng: poi.lng,
+      address: poi.address,
+      label: poi.name,
+    };
+    setOrigin(start);
+    setDestination(dest);
+    setWaypoints([]);
+    void runRouteCalculation(
+      start,
+      dest,
+      [],
+      { routeType: "fastest", avoidTolls: false, avoidHighways: false },
+      true,
+    );
+  };
+
+  // Workflow E: Execute clickable AI Companion map actions directly on 2D/3D viewport
+  const handleExecuteCompanionAction = (action: CompanionMapAction) => {
+    if (
+      (action.type === "apply_route" || action.type === "apply_emergency_route") &&
+      action.routeResult
+    ) {
+      setOrigin(action.routeResult.origin);
+      setDestination(action.routeResult.destination);
+      setWaypoints(action.routeResult.waypoints || []);
+      setRouteResult(action.routeResult);
+      setSelectedRouteId(action.routeResult.recommendedRouteId);
+      toast.success(`Applied AI route to 2D & 3D views.`);
+      return;
+    }
+
+    if (action.type === "add_stop" && action.poi) {
+      handleAddPOIToRoute(action.poi);
+      return;
+    }
+
+    if (action.type === "highlight_pois" && action.pois && action.pois.length > 0) {
+      const isEmergencySet = action.pois.some(
+        (p) => p.category === "hospital" || p.category === "police" || p.category === "fire",
+      );
+      if (isEmergencySet) {
+        setEmergencyPOIs(action.pois);
+      } else {
+        setDiscoveredPOIs(action.pois);
+      }
+      setFocusPoint({ lat: action.pois[0].lat, lng: action.pois[0].lng });
+      toast.success(`Highlighted ${action.pois.length} OpenStreetMap location(s) on map.`);
+    }
+  };
+
+  const navItems = [
+    { to: "/planner", label: "Planner", icon: Compass },
+    { to: "/stops", label: "Stops", icon: ParkingSquare },
+    { to: "/safety", label: "Safety", icon: ShieldAlert },
+    { to: "/emergency", label: "Emergency", icon: Siren },
+    { to: "/insights", label: "Insights", icon: BarChart3 },
+  ];
+
+  return (
+    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+      {/* Clean Single-Row 3-Zone Top Navigation Bar */}
+      <header className="sticky top-0 z-40 h-14 px-4 lg:px-6 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-4">
+        {/* Zone 1: Brand Wordmark */}
+        <div className="flex items-center gap-2.5 shrink-0">
+          <div className="w-7 h-7 rounded-lg bg-blue-600 text-white flex items-center justify-center font-display font-bold text-xs">
+            SR
+          </div>
+          <span className="font-display font-semibold text-base tracking-tight text-slate-900 dark:text-white whitespace-nowrap">
+            SmartRoutes
+          </span>
+        </div>
+
+        {/* Zone 2: Single-Line Navigation Links */}
+        <nav className="flex items-center gap-1 overflow-x-auto" aria-label="Primary navigation">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            return (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                className={({ isActive }) =>
+                  `flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors ${
+                    isActive
+                      ? "bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300"
+                      : "text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white"
+                  }`
+                }
+              >
+                <Icon className="w-3.5 h-3.5" />
+                <span>{item.label}</span>
+              </NavLink>
+            );
+          })}
+        </nav>
+
+        {/* Zone 3: Compact Right Actions */}
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={onToggleTheme}
+            aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+          >
+            {theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setCompanionOpen(true)}
+            className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium flex items-center gap-1.5 whitespace-nowrap transition-colors"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>AI Companion</span>
+          </button>
+
+          <SignOutButton />
+        </div>
+      </header>
+
+      {/* Main Split Command Center Workspace */}
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 p-4 max-w-[1920px] w-full mx-auto">
+        {/* Left Control & Intelligence Panel */}
+        <section className="lg:col-span-4 xl:col-span-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 overflow-y-auto lg:max-h-[calc(100vh-5.5rem)]">
+          <Routes>
+            <Route
+              path="/planner"
+              element={
+                <RoutePlannerPanel
+                  origin={origin}
+                  destination={destination}
+                  waypoints={waypoints}
+                  preferences={preferences}
+                  routeResult={routeResult}
+                  selectedRouteId={selectedRouteId}
+                  isCalculating={isCalculatingRoute}
+                  savedJourneys={savedJourneys}
+                  favourites={favourites}
+                  onChangeOrigin={setOrigin}
+                  onChangeDestination={setDestination}
+                  onRemoveWaypoint={handleRemoveWaypoint}
+                  onChangePreferences={setPreferences}
+                  onCalculateRoute={handleCalculateRoute}
+                  onSelectRoute={setSelectedRouteId}
+                  onSaveJourney={handleSaveJourney}
+                  onLoadSavedJourney={handleLoadSavedJourney}
+                  onDeleteSavedJourney={handleDeleteSavedJourney}
+                  onRequestMapPick={(mode) => {
+                    if (viewMode === "3d") setViewMode("split");
+                    setMapPickMode(mode);
+                  }}
+                  onUseCurrentLocation={handleUseCurrentLocation}
+                  onAskAIExplainRoute={() => {
+                    setPendingAIPrompt(
+                      "Analyze my active route alternatives, compare travel time vs turn complexity, and explain which option is best and why.",
+                    );
+                    setCompanionOpen(true);
+                  }}
+                />
+              }
+            />
+
+            <Route
+              path="/stops"
+              element={
+                <StopsAndParkingPanel
+                  routeResult={routeResult}
+                  discoveredPOIs={discoveredPOIs}
+                  isSearchingPOIs={isSearchingPOIs}
+                  onDiscoverPOIs={(cat, anchor) => void handleDiscoverPOIs(cat, anchor)}
+                  onAddStopToJourney={handleAddPOIToRoute}
+                  onFocusPoint={(lat, lng) => setFocusPoint({ lat, lng })}
+                />
+              }
+            />
+
+            <Route
+              path="/safety"
+              element={
+                <SafetyAndCommunityPanel
+                  reports={communityReports}
+                  currentUserId={loggedInUser?._id ?? null}
+                  selectedReportLocation={selectedReportLocation}
+                  weather={weather}
+                  onRequestMapPickForReport={() => {
+                    if (viewMode === "3d") setViewMode("split");
+                    setMapPickMode("report");
+                  }}
+                  onSubmitReport={handleSubmitCommunityReport}
+                  onConfirmReport={async (id) => {
+                    await confirmReportMutation({ reportId: id as any });
+                    toast.success("Confirmed community report.");
+                  }}
+                  onFlagReport={async (id) => {
+                    await flagReportMutation({ reportId: id as any });
+                    toast.info("Flagged report for review.");
+                  }}
+                  onResolveReport={async (id) => {
+                    await resolveReportMutation({ reportId: id as any });
+                    toast.success("Report marked resolved.");
+                  }}
+                  onFocusPoint={(lat, lng) => setFocusPoint({ lat, lng })}
+                />
+              }
+            />
+
+            <Route
+              path="/emergency"
+              element={
+                <EmergencyPanel
+                  emergencyPOIs={emergencyPOIs}
+                  isSearching={isSearchingEmergency}
+                  activeEmergencyRoute={routeResult?.isEmergency ? routeResult : null}
+                  preferences={savedPreferences || null}
+                  currentCoords={userLocation || origin || routeResult?.origin || null}
+                  onDiscoverEmergency={(cat) => void handleDiscoverEmergency(cat)}
+                  onRouteToFacility={handleRouteToEmergencyFacility}
+                />
+              }
+            />
+
+            <Route
+              path="/insights"
+              element={
+                <InsightsAndProfilePanel
+                  savedJourneys={savedJourneys}
+                  communityReports={communityReports}
+                  favourites={favourites}
+                  preferences={savedPreferences || null}
+                  onSavePreferences={async (next) => {
+                    await savePreferencesMutation(next);
+                    setPreferences((prev) => ({
+                      ...prev,
+                      routeType: next.preferredRouteType,
+                      avoidTolls: next.avoidTolls,
+                      avoidHighways: next.avoidHighways,
+                    }));
+                  }}
+                  onAddFavourite={async (fav) => {
+                    await addFavouriteMutation(fav);
+                    toast.success(`Saved favourite: ${fav.label}`);
+                  }}
+                  onRemoveFavourite={async (id) => {
+                    await removeFavouriteMutation({ favouriteId: id as any });
+                    toast.success("Favourite removed.");
+                  }}
+                  onUseFavouriteAsDestination={(fav) => {
+                    setDestination({
+                      lat: fav.lat,
+                      lng: fav.lng,
+                      address: fav.address,
+                      label: fav.label,
+                    });
+                    setFocusPoint({ lat: fav.lat, lng: fav.lng });
+                    navigate("/planner");
+                    toast.success(`Destination set to ${fav.label}.`);
+                  }}
+                  onDeleteAllPersonalData={async () => {
+                    await deleteAllPersonalDataMutation({});
+                    setActiveSavedJourneyId(null);
+                    toast.success("Deleted all saved journeys, favourites, chat sessions, and preferences.");
+                  }}
+                />
+              }
+            />
+
+            <Route path="*" element={<Navigate to="/planner" replace />} />
+          </Routes>
+        </section>
+
+        {/* Right Synchronized 2D / 3D Spatial Viewport */}
+        <section className="lg:col-span-8 xl:col-span-8 min-h-[520px] lg:h-[calc(100vh-5.5rem)]">
+          <MapViewport
+            viewMode={viewMode}
+            onChangeViewMode={setViewMode}
+            routeResult={routeResult}
+            selectedRouteId={selectedRouteId}
+            onSelectRoute={setSelectedRouteId}
+            discoveredPOIs={visibleMapPOIs}
+            onAddPOIToRoute={handleAddPOIToRoute}
+            communityReports={communityReports}
+            urbanContext={urbanContext}
+            weather={weather}
+            theme={theme}
+            nightScene3D={nightScene3D}
+            onToggleNightScene3D={() => setNightScene3D((n) => !n)}
+            mapPickMode={mapPickMode}
+            onCancelMapPick={() => setMapPickMode("none")}
+            onMapClick={(lat, lng) => void handleMapClick(lat, lng)}
+            focusPoint={focusPoint}
+          />
+        </section>
+      </main>
+
+      {/* Multi-Agent Gemini AI Driving Companion Drawer */}
+      <DrivingCompanionDrawer
+        isOpen={companionOpen}
+        onClose={() => setCompanionOpen(false)}
+        activeRoute={routeResult}
+        selectedRouteId={selectedRouteId}
+        communityReports={communityReports}
+        preferences={savedPreferences || null}
+        userLocation={userLocation}
+        onExecuteMapAction={handleExecuteCompanionAction}
+        pendingPrompt={pendingAIPrompt}
+        onConsumePendingPrompt={() => setPendingAIPrompt(null)}
+      />
+    </div>
+  );
+}

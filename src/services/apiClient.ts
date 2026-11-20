@@ -13,6 +13,23 @@ import type {
   WeatherSnapshot,
 } from "../types/mobility";
 
+async function safeParseJson<T>(res: Response, fallbackLabel: string): Promise<T> {
+  const contentType = res.headers.get("content-type") || "";
+  const raw = await res.text();
+  if (!contentType.includes("application/json") && raw.trimStart().startsWith("<")) {
+    throw new Error(
+      `${fallbackLabel} returned an unexpected server response (HTTP ${res.status}). The backend may be restarting or busy — please retry in a moment.`,
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `${fallbackLabel} returned unreadable data (HTTP ${res.status}). Please retry.`,
+    );
+  }
+}
+
 export async function apiSearchLocations(
   query: string,
   near?: { lat: number; lng: number },
@@ -23,7 +40,10 @@ export async function apiSearchLocations(
     params.set("lng", String(near.lng));
   }
   const res = await fetch(`/api/geo/search?${params.toString()}`);
-  const data = await res.json();
+  const data = await safeParseJson<{ results?: GeoPoint[]; error?: string }>(
+    res,
+    "Location search",
+  );
   if (!res.ok) throw new Error(data.error || "Location search failed");
   return data.results || [];
 }
@@ -137,6 +157,28 @@ export async function apiFetchTraffic(
   }
 }
 
+function compactRouteForCompanion(
+  route: PredictiveRouteResult | null | undefined,
+): PredictiveRouteResult | null | undefined {
+  if (!route) return route;
+  return {
+    ...route,
+    alternatives: route.alternatives.map((alt) => {
+      // Keep up to 30 sampled geometry points (sufficient for safety corridor checks) to keep payload light
+      const geom = alt.geometry || [];
+      const sampled =
+        geom.length <= 30
+          ? geom
+          : geom.filter((_, i) => i === 0 || i === geom.length - 1 || i % Math.ceil(geom.length / 28) === 0);
+      return {
+        ...alt,
+        geometry: sampled,
+        steps: (alt.steps || []).slice(0, 25),
+      };
+    }),
+  };
+}
+
 export async function apiAskCompanion(params: {
   message: string;
   activeRoute?: PredictiveRouteResult | null;
@@ -148,23 +190,63 @@ export async function apiAskCompanion(params: {
   liveTraffic?: LiveTrafficSnapshot | null;
   history?: Array<{ role: "user" | "assistant"; content: string }>;
 }): Promise<CompanionResponse> {
-  const res = await fetch("/api/ai/companion", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message: params.message,
-      context: {
-        activeRoute: params.activeRoute,
-        selectedRouteId: params.selectedRouteId,
-        communityReports: params.communityReports,
-        preferences: params.preferences,
-        userLocation: params.userLocation,
-        liveNavigation: params.liveNavigation,
-        liveTraffic: params.liveTraffic,
-        history: params.history,
-      },
-    }),
+  const payload = JSON.stringify({
+    message: params.message,
+    context: {
+      activeRoute: compactRouteForCompanion(params.activeRoute),
+      selectedRouteId: params.selectedRouteId,
+      communityReports: (params.communityReports || []).slice(0, 25),
+      preferences: params.preferences,
+      userLocation: params.userLocation,
+      liveNavigation: params.liveNavigation,
+      liveTraffic: params.liveTraffic,
+      history: params.history,
+    },
   });
-  const data = (await res.json()) as CompanionResponse;
-  return data;
+
+  // Attempt once; if a reverse proxy returns transient HTML (e.g., 502/504 during warmup), retry once
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch("/api/ai/companion", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+    });
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    const isHtml = !contentType.includes("application/json") && raw.trimStart().startsWith("<");
+
+    if (isHtml) {
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 900));
+        continue;
+      }
+      return {
+        reply: "",
+        agentsUsed: [],
+        toolTraces: [],
+        mapActions: [],
+        error: `AI Companion request timed out or backend server was momentarily unavailable (HTTP ${res.status}). Please click Send to try again.`,
+      };
+    }
+
+    try {
+      return JSON.parse(raw) as CompanionResponse;
+    } catch {
+      return {
+        reply: "",
+        agentsUsed: [],
+        toolTraces: [],
+        mapActions: [],
+        error: `AI Companion returned an invalid response (HTTP ${res.status}). Please retry.`,
+      };
+    }
+  }
+
+  return {
+    reply: "",
+    agentsUsed: [],
+    toolTraces: [],
+    mapActions: [],
+    error: "AI Companion could not be reached. Please try again.",
+  };
 }

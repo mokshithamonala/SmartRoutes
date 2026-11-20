@@ -64,7 +64,7 @@ process.on("uncaughtException", (err) => {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: "2mb" }));
+  app.use(express.json({ limit: "4mb" }));
 
   // Health & capability status (never exposes secrets)
   app.get("/api/health", (_req, res) => {
@@ -296,6 +296,11 @@ async function startServer() {
         error: err?.message || "AI Companion request failed",
       });
     }
+  });
+
+  // Ensure unmatched /api/* routes always return JSON instead of falling through to index.html
+  app.all("/api/{*splat}", (_req, res) => {
+    res.status(404).json({ error: "API endpoint not found." });
   });
 
   // Frontend serving (Vite dev middleware in dev, dist/ static in prod)

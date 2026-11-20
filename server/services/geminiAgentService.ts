@@ -23,6 +23,8 @@ import { discoverPOIs } from "./poiAndUrbanService";
 import { getWeatherContext } from "./weatherService";
 
 const MODEL_NAME = "gemini-4-hydrogen";
+const FALLBACK_MODEL = "gemini-3.1-flash-lite";
+let primaryModelCooldownUntil = 0;
 
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -711,16 +713,18 @@ STRICT GROUNDING & SAFETY RULES:
   const toolTraces: AgentToolTrace[] = [];
   const mapActions: CompanionMapAction[] = [];
   const agentsUsed = new Set<string>();
-  let activeModel = MODEL_NAME;
+  let activeModel =
+    Date.now() < primaryModelCooldownUntil ? FALLBACK_MODEL : MODEL_NAME;
 
   const callModel = async () => {
-    const modelsToTry = [
-      activeModel,
-      "gemini-3.1-flash-lite",
-      "gemini-2.5-flash",
-    ].filter((m, i, arr) => arr.indexOf(m) === i);
+    const modelsToTry =
+      activeModel === MODEL_NAME
+        ? [MODEL_NAME, FALLBACK_MODEL, FALLBACK_MODEL]
+        : [FALLBACK_MODEL, MODEL_NAME, FALLBACK_MODEL];
     let lastErr: any;
-    for (const model of modelsToTry) {
+    for (let idx = 0; idx < modelsToTry.length; idx++) {
+      const model = modelsToTry[idx];
+      const timeoutMs = model === MODEL_NAME ? 8500 : idx === 0 ? 12000 : 16000;
       try {
         const res = await ai.models.generateContent({
           model,
@@ -728,7 +732,7 @@ STRICT GROUNDING & SAFETY RULES:
           config: {
             systemInstruction,
             tools: [{ functionDeclarations: AGENT_TOOL_DECLARATIONS }],
-            abortSignal: AbortSignal.timeout(22000),
+            abortSignal: AbortSignal.timeout(timeoutMs),
           },
         });
         activeModel = model;
@@ -736,11 +740,24 @@ STRICT GROUNDING & SAFETY RULES:
       } catch (err: any) {
         lastErr = err;
         const msg = String(err?.message || "");
+        const errName = String(err?.name || "");
         const isTransient =
           err?.status === 503 ||
+          err?.status === 429 ||
+          err?.status === 504 ||
+          errName === "AbortError" ||
+          errName === "TimeoutError" ||
           msg.includes("503") ||
+          msg.includes("429") ||
           msg.includes("UNAVAILABLE") ||
-          msg.includes("high demand");
+          msg.includes("high demand") ||
+          msg.includes("aborted") ||
+          msg.includes("timeout") ||
+          msg.includes("timed out");
+        if (model === MODEL_NAME && isTransient) {
+          // Cool down stalled/overloaded primary model for 3 minutes so follow-up rounds stay snappy
+          primaryModelCooldownUntil = Date.now() + 3 * 60 * 1000;
+        }
         if (!isTransient) {
           throw err;
         }

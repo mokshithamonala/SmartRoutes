@@ -4,6 +4,7 @@ import type {
   PredictiveRouteResult,
   RouteAlternative,
   RoutePreferences,
+  RouteStepInstruction,
   TurnComplexityAnalysis,
 } from "../../src/types/mobility";
 
@@ -65,15 +66,48 @@ export function haversineKm(
   return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
+export interface NominatimBoundedPOI {
+  id: string;
+  lat: number;
+  lng: number;
+  name: string;
+  address: string;
+  hasAddress: boolean;
+  distanceKm: number;
+  openingHours?: string;
+  phone?: string;
+  website?: string;
+  brand?: string;
+  operator?: string;
+  accessibility?: string;
+  capacity?: number | null;
+}
+
+function buildBoundingBox(lat: number, lng: number, radiusKm: number): string {
+  const clampedKm = Math.min(Math.max(radiusKm, 0.5), 50);
+  const dLat = clampedKm / 111.32;
+  const cosLat = Math.max(Math.cos((lat * Math.PI) / 180), 0.2);
+  const dLng = clampedKm / (111.32 * cosLat);
+  const left = Math.max(-180, lng - dLng);
+  const right = Math.min(180, lng + dLng);
+  const top = Math.min(90, lat + dLat);
+  const bottom = Math.max(-90, lat - dLat);
+  return `${left.toFixed(5)},${top.toFixed(5)},${right.toFixed(5)},${bottom.toFixed(5)}`;
+}
+
 export async function searchLocations(
   query: string,
   limit = 6,
   near?: { lat: number; lng: number },
+  options?: { bounded?: boolean; radiusKm?: number },
 ): Promise<GeoPoint[]> {
   const trimmed = query.trim();
   if (trimmed.length < 2) return [];
 
-  const cacheKey = `search:${trimmed.toLowerCase()}:${limit}:${near ? `${near.lat.toFixed(2)},${near.lng.toFixed(2)}` : ""}`;
+  const bounded = Boolean(options?.bounded && near);
+  const radiusKm = options?.radiusKm ?? 25;
+
+  const cacheKey = `search:${trimmed.toLowerCase()}:${limit}:${near ? `${near.lat.toFixed(2)},${near.lng.toFixed(2)}` : ""}:${bounded ? `b${radiusKm}` : "u"}`;
   const cached = geoCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) {
     return cached.data;
@@ -85,15 +119,14 @@ export async function searchLocations(
     q: trimmed,
     format: "jsonv2",
     addressdetails: "1",
-    limit: String(Math.min(Math.max(limit, 1), 10)),
+    limit: String(Math.min(Math.max(limit, 1), 15)),
   });
 
   if (near) {
-    const d = 0.35;
-    params.set(
-      "viewbox",
-      `${near.lng - d},${near.lat + d},${near.lng + d},${near.lat - d}`,
-    );
+    params.set("viewbox", buildBoundingBox(near.lat, near.lng, bounded ? radiusKm : 35));
+    if (bounded) {
+      params.set("bounded", "1");
+    }
   }
 
   const res = await fetch(`${NOMINATIM_BASE}/search?${params.toString()}`, {
@@ -115,15 +148,140 @@ export async function searchLocations(
     name?: string;
   }>;
 
-  const results: GeoPoint[] = rows.map((row) => ({
-    lat: Number(row.lat),
-    lng: Number(row.lon),
-    address: row.display_name,
-    label: row.name || row.display_name.split(",")[0],
-  }));
+  let results: GeoPoint[] = rows
+    .map((row) => ({
+      lat: Number(row.lat),
+      lng: Number(row.lon),
+      address: row.display_name,
+      label: row.name || row.display_name.split(",")[0],
+    }))
+    .filter((pt) => Number.isFinite(pt.lat) && Number.isFinite(pt.lng));
+
+  if (bounded && near) {
+    results = results.filter(
+      (pt) => haversineKm(near.lat, near.lng, pt.lat, pt.lng) <= radiusKm,
+    );
+  }
 
   geoCache.set(cacheKey, { expires: Date.now() + CACHE_TTL_MS, data: results });
   return results;
+}
+
+export async function searchNominatimBoundedPOIs(
+  query: string,
+  near: { lat: number; lng: number },
+  radiusKm: number,
+  limit = 12,
+  fallbackLabel?: string,
+): Promise<NominatimBoundedPOI[]> {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+
+  const cacheKey = `nompoi:${trimmed.toLowerCase()}:${near.lat.toFixed(3)},${near.lng.toFixed(3)}:${radiusKm.toFixed(1)}:${limit}`;
+  const cached = geoCache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) {
+    return cached.data;
+  }
+
+  await waitForNominatimSlot();
+
+  const params = new URLSearchParams({
+    q: trimmed,
+    format: "jsonv2",
+    addressdetails: "1",
+    extratags: "1",
+    bounded: "1",
+    viewbox: buildBoundingBox(near.lat, near.lng, radiusKm),
+    limit: String(Math.min(Math.max(limit * 2, 10), 25)),
+  });
+
+  const res = await fetch(`${NOMINATIM_BASE}/search?${params.toString()}`, {
+    headers: {
+      "User-Agent": USER_AGENT,
+      Accept: "application/json",
+    },
+    signal: AbortSignal.timeout(9000),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Nominatim bounded search failed (HTTP ${res.status})`);
+  }
+
+  const rows = (await res.json()) as Array<{
+    place_id?: number;
+    osm_type?: string;
+    osm_id?: number;
+    type?: string;
+    lat: string;
+    lon: string;
+    display_name?: string;
+    name?: string;
+    extratags?: Record<string, string>;
+  }>;
+
+  const out: NominatimBoundedPOI[] = [];
+  for (const row of rows) {
+    const rLat = Number(row.lat);
+    const rLng = Number(row.lon);
+    if (!Number.isFinite(rLat) || !Number.isFinite(rLng)) continue;
+
+    const distanceKm = haversineKm(near.lat, near.lng, rLat, rLng);
+    // Strict radius enforcement — never leak results outside requested radius
+    if (distanceKm > radiusKm) continue;
+
+    const extras = row.extratags || {};
+    const displayName = (row.display_name || "").trim();
+    const firstAddrPart = displayName.split(",")[0]?.trim() || "";
+    const explicitName = (
+      row.name ||
+      extras.name ||
+      extras["name:en"] ||
+      extras.brand ||
+      extras.operator ||
+      ""
+    ).trim();
+
+    const name =
+      explicitName ||
+      (fallbackLabel && firstAddrPart
+        ? `${fallbackLabel} (${firstAddrPart})`
+        : fallbackLabel || firstAddrPart);
+
+    if (!name) continue;
+
+    const capNum = extras.capacity ? Number.parseInt(extras.capacity, 10) : null;
+    const stableId =
+      row.osm_type && row.osm_id
+        ? `osm_${row.osm_type}_${row.osm_id}`
+        : `nom_${row.place_id || `${rLat.toFixed(5)}_${rLng.toFixed(5)}`}`;
+
+    out.push({
+      id: stableId,
+      lat: rLat,
+      lng: rLng,
+      name,
+      address: displayName || "Not available",
+      hasAddress: Boolean(displayName),
+      distanceKm: Number(distanceKm.toFixed(2)),
+      openingHours: extras.opening_hours || undefined,
+      phone: extras.phone || extras["contact:phone"] || undefined,
+      website: extras.website || extras["contact:website"] || undefined,
+      brand: extras.brand || undefined,
+      operator: extras.operator || undefined,
+      accessibility:
+        extras.wheelchair === "yes"
+          ? "Wheelchair accessible"
+          : extras.wheelchair === "limited"
+            ? "Limited wheelchair access"
+            : undefined,
+      capacity: Number.isFinite(capNum) ? capNum : null,
+    });
+  }
+
+  out.sort((a, b) => a.distanceKm - b.distanceKm);
+  const sliced = out.slice(0, limit);
+  geoCache.set(cacheKey, { expires: Date.now() + CACHE_TTL_MS, data: sliced });
+  return sliced;
 }
 
 export async function reverseGeocode(
@@ -273,6 +431,92 @@ function analyzeTurns(legs: any[]): TurnComplexityAnalysis {
   };
 }
 
+function formatManeuverText(
+  maneuverType: string,
+  modifier: string | undefined,
+  roadName: string,
+  exit?: number,
+): string {
+  const onto = roadName ? ` onto ${roadName}` : "";
+  const on = roadName ? ` on ${roadName}` : "";
+  const mod = (modifier || "").replace(/_/g, " ").trim();
+
+  switch (maneuverType) {
+    case "depart":
+      return roadName ? `Head out on ${roadName}` : "Start driving along the route";
+    case "arrive":
+      return "Arrive at your destination";
+    case "turn":
+      if (mod === "uturn") return `Make a U-turn${onto}`;
+      if (mod === "straight") return `Continue straight${on}`;
+      if (mod) return `Turn ${mod}${onto}`;
+      return `Turn${onto}`;
+    case "new name":
+      return roadName ? `Continue onto ${roadName}` : "Continue straight";
+    case "continue":
+      if (mod && mod !== "straight") return `Keep ${mod}${onto}`;
+      return `Continue straight${on}`;
+    case "merge":
+      return mod ? `Merge ${mod}${onto}` : `Merge${onto}`;
+    case "on ramp":
+      return mod ? `Take the ramp ${mod}${onto}` : `Take the ramp${onto}`;
+    case "off ramp":
+      return mod ? `Take the exit ${mod}${onto}` : `Take the exit${onto}`;
+    case "fork":
+      return mod ? `Keep ${mod} at the fork${onto}` : `Follow the fork${onto}`;
+    case "end of road":
+      return mod ? `At the end of the road, turn ${mod}${onto}` : `Turn at the end of the road${onto}`;
+    case "roundabout":
+    case "rotary":
+    case "roundabout turn":
+      if (exit) return `At the roundabout, take exit ${exit}${onto}`;
+      return `Enter the roundabout${onto}`;
+    case "exit roundabout":
+    case "exit rotary":
+      return `Exit the roundabout${onto}`;
+    default:
+      if (mod) return `Proceed ${mod}${onto}`;
+      return roadName ? `Continue on ${roadName}` : "Continue ahead";
+  }
+}
+
+function buildRouteSteps(legs: any[]): RouteStepInstruction[] {
+  const steps: RouteStepInstruction[] = [];
+  let idx = 0;
+
+  for (const leg of legs || []) {
+    for (const step of leg.steps || []) {
+      const loc = step.maneuver?.location;
+      const lng = Array.isArray(loc) ? Number(loc[0]) : NaN;
+      const lat = Array.isArray(loc) ? Number(loc[1]) : NaN;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+      const maneuverType = String(step.maneuver?.type || "continue");
+      const modifier = step.maneuver?.modifier ? String(step.maneuver.modifier) : undefined;
+      const exit =
+        typeof step.maneuver?.exit === "number" ? step.maneuver.exit : undefined;
+      const rawName = typeof step.name === "string" ? step.name.trim() : "";
+      const refName = typeof step.ref === "string" ? step.ref.trim() : "";
+      const roadName = rawName || refName || "";
+
+      steps.push({
+        index: idx++,
+        instruction: formatManeuverText(maneuverType, modifier, roadName, exit),
+        roadName: roadName || "Unnamed road",
+        maneuverType,
+        modifier,
+        distanceMeters: Math.round(Number(step.distance) || 0),
+        durationSeconds: Math.round(Number(step.duration) || 0),
+        lat,
+        lng,
+        exit,
+      });
+    }
+  }
+
+  return steps;
+}
+
 function downsampleCoordinates(
   coords: Array<[number, number]>,
   maxPoints = 320,
@@ -353,6 +597,7 @@ export async function calculatePredictiveRoute(params: {
       route.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
     );
     const turns = analyzeTurns(route.legs);
+    const steps = buildRouteSteps(route.legs);
 
     return {
       routeId: `osrm_route_${idx + 1}`,
@@ -360,6 +605,7 @@ export async function calculatePredictiveRoute(params: {
       durationMin,
       estimatedAvgSpeedKmh,
       geometry,
+      steps,
       turns,
     };
   });

@@ -9,6 +9,8 @@ import type {
   CommunityReport,
   CompanionMapAction,
   CompanionResponse,
+  LiveNavigationSnapshot,
+  LiveTrafficSnapshot,
   PredictiveRouteResult,
   UserPreferencesRecord,
 } from "../../src/types/mobility";
@@ -139,6 +141,20 @@ const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
       },
     },
   },
+  {
+    name: "get_live_navigation_status",
+    description:
+      "Live Navigation Agent: Read the driver's real-time navigation status including remaining distance to destination, estimated arrival time (ETA), next upcoming turn instruction and distance to turn, following turn, on-route vs off-route status, current speed/position, and verified live traffic availability.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        detail: {
+          type: Type.STRING,
+          description: "Optional focus: distance, next_turn, eta, route_status, or full.",
+        },
+      },
+    },
+  },
 ];
 
 export interface CompanionContextInput {
@@ -147,6 +163,8 @@ export interface CompanionContextInput {
   communityReports?: CommunityReport[];
   preferences?: Partial<UserPreferencesRecord> | null;
   userLocation?: { lat: number; lng: number } | null;
+  liveNavigation?: LiveNavigationSnapshot | null;
+  liveTraffic?: LiveTrafficSnapshot | null;
   history?: Array<{ role: "user" | "assistant"; content: string }>;
 }
 
@@ -157,6 +175,7 @@ const TOOL_AGENT_MAP: Record<string, AgentToolTrace["agent"]> = {
   discover_stops: "Parking & Stop Discovery Agent",
   find_emergency_services: "Emergency Assistance Agent",
   generate_journey_briefing: "Journey Summary Agent",
+  get_live_navigation_status: "Live Navigation Agent",
 };
 
 async function executeAgentTool(
@@ -526,6 +545,107 @@ async function executeAgentTool(
     };
   }
 
+  if (toolName === "get_live_navigation_status") {
+    const nav = ctx.liveNavigation || null;
+    const traffic = ctx.liveTraffic || null;
+
+    if (!activeRoute || !activeAlt) {
+      return {
+        result: {
+          hasActiveRoute: false,
+          navigationMode: "idle",
+          message:
+            "No destination or active route is currently set. Ask the driver where they would like to go.",
+        },
+        summary: "No active route set for live navigation",
+      };
+    }
+
+    const etaIso =
+      nav?.etaTimestamp
+        ? new Date(nav.etaTimestamp).toLocaleTimeString("en-US", {
+            hour: "numeric",
+            minute: "2-digit",
+          })
+        : new Date(Date.now() + activeAlt.durationMin * 60_000).toLocaleTimeString(
+            "en-US",
+            { hour: "numeric", minute: "2-digit" },
+          );
+
+    const remainingKm = nav?.isNavigating
+      ? nav.remainingDistanceKm
+      : activeAlt.distanceKm;
+    const remainingMin = nav?.isNavigating
+      ? nav.remainingDurationMin
+      : activeAlt.durationMin;
+    const nextStep = nav?.nextStep || activeAlt.steps?.[1] || activeAlt.steps?.[0] || null;
+    const followingStep =
+      nav?.followingStep || activeAlt.steps?.[2] || null;
+
+    return {
+      result: {
+        hasActiveRoute: true,
+        navigationStatus: nav?.status || "idle",
+        trackingSource:
+          nav?.status === "gps_active"
+            ? "Live Browser GPS"
+            : nav?.status === "preview_demo"
+              ? "Simulated Route Preview (Demo)"
+              : "Route Planned (Navigation not started yet)",
+        destination: activeRoute.destination.label || activeRoute.destination.address,
+        origin: activeRoute.origin.label || activeRoute.origin.address,
+        progressPercent: nav ? Math.round(nav.progressFraction * 100) : 0,
+        remainingDistanceKm: Number(remainingKm.toFixed(2)),
+        remainingDurationMin: Math.max(0, Math.round(remainingMin)),
+        estimatedArrivalTime: etaIso,
+        etaSourceNote: traffic?.available
+          ? `OSRM road geometry + ${traffic.provider} flow`
+          : "OSRM road-speed estimate (no verified live traffic API connected)",
+        isOnCorrectRoute: nav?.isNavigating ? !nav.isOffRoute : true,
+        isOffRoute: Boolean(nav?.isOffRoute),
+        offRouteDeviationMeters: nav?.offRouteDistanceM ?? 0,
+        isRecalculating: Boolean(nav?.isRecalculating),
+        nextTurn: nextStep
+          ? {
+              instruction: nextStep.instruction,
+              roadName: nextStep.roadName,
+              distanceMeters:
+                nav?.distanceToNextStepM ?? nextStep.distanceMeters,
+              maneuverType: nextStep.maneuverType,
+            }
+          : null,
+        followingTurn: followingStep
+          ? {
+              instruction: followingStep.instruction,
+              roadName: followingStep.roadName,
+              distanceMeters: followingStep.distanceMeters,
+            }
+          : null,
+        currentSpeedKmh: nav?.currentPosition?.speedKmh ?? null,
+        currentCoordinates: nav?.currentPosition
+          ? {
+              lat: Number(nav.currentPosition.lat.toFixed(5)),
+              lng: Number(nav.currentPosition.lng.toFixed(5)),
+            }
+          : null,
+        liveTraffic: traffic?.available
+          ? {
+              available: true,
+              provider: traffic.provider,
+              flow: traffic.flow,
+              incidentsCount: traffic.incidents.length,
+            }
+          : {
+              available: false,
+              reason:
+                traffic?.reason ||
+                "Live traffic feed not configured; using OSRM road-speed estimates.",
+            },
+      },
+      summary: `Live nav: ${remainingKm.toFixed(1)} km left, ~${Math.round(remainingMin)} min (${nav?.isOffRoute ? "OFF ROUTE" : "on route"})`,
+    };
+  }
+
   return {
     result: { error: `Unknown tool: ${toolName}` },
     summary: `Unknown tool ${toolName}`,
@@ -548,15 +668,21 @@ export async function runMultiAgentCompanion(params: {
     };
   }
 
-  const systemInstruction = `You are the SmartRoutes AI Driving Companion — a multi-agent mobility intelligence assistant backed by real OpenStreetMap, OSRM, Open-Meteo, and user-saved application tools.
+  const systemInstruction = `You are the SmartRoutes AI Driving Companion — a multi-agent mobility intelligence assistant backed by real OpenStreetMap, OSRM, Open-Meteo, and live navigation telemetry.
 
 STRICT GROUNDING & SAFETY RULES:
-1. Whenever the driver asks to plan a route, compare alternatives, find parking/stops, check weather/safety, locate emergency services, or prepare a journey briefing, call the appropriate tool(s) first before answering. For simple greetings or capability questions, answer directly without unnecessary tool calls.
-2. NEVER invent or fabricate parking availability, live traffic congestion, road incidents, weather, or geographic places. If parking occupancy is unknown, explicitly say availability is unknown because no live sensor feed is connected.
-3. Always distinguish OSRM estimated travel time from verified live traffic.
-4. For emergency requests, clearly remind the driver that SmartRoutes is decision-support only and cannot dispatch emergency services or control traffic signals.
-5. Safe-driving guidance: keep answers concise, scannable, and advise reviewing routes while parked rather than interacting with the screen while driving.
-6. Format responses cleanly in plain readable prose with short bullet points where helpful.`;
+1. Whenever the driver asks about remaining distance, next turn, ETA, whether they are on the correct route, or live driving progress (e.g., "How far is my destination?", "When is my next turn?", "What is the estimated arrival time?", "Am I on the correct route?"), ALWAYS call get_live_navigation_status first before answering.
+2. Whenever the driver asks to plan a route, compare alternatives, find nearby stops/parking, check weather/safety, locate emergency services, or prepare a journey briefing, call the appropriate tool(s) first. For simple greetings or capability questions, answer directly without unnecessary tool calls.
+3. NEVER invent or fabricate parking availability, live traffic congestion, road incidents, weather, turns, or geographic places. If live traffic or parking occupancy is unavailable, state that explicitly.
+4. Always distinguish OSRM estimated travel time from verified live traffic, and clearly state if the app is currently in Simulated Route Preview (Demo) mode vs Live GPS mode.
+5. For emergency requests, clearly remind the driver that SmartRoutes is decision-support only and cannot dispatch emergency services or control traffic signals.
+6. Safe-driving guidance: keep answers concise, scannable, and advise reviewing routes while parked rather than interacting with the screen while driving.
+7. Format responses cleanly in plain readable prose with short bullet points where helpful.`;
+
+  const nav = params.context.liveNavigation;
+  const navLine = nav
+    ? `${nav.status} | Remaining: ${nav.remainingDistanceKm.toFixed(1)} km (~${Math.round(nav.remainingDurationMin)} min) | On route: ${!nav.isOffRoute}${nav.nextStep ? ` | Next turn: ${nav.nextStep.instruction}${nav.distanceToNextStepM != null ? ` in ${Math.round(nav.distanceToNextStepM)} m` : ""}` : ""}`
+    : "Navigation idle";
 
   const contextPreamble = `Current workspace snapshot:
 - Active route: ${
@@ -564,6 +690,8 @@ STRICT GROUNDING & SAFETY RULES:
       ? `${params.context.activeRoute.origin.address} -> ${params.context.activeRoute.destination.address} (${params.context.activeRoute.alternatives.length} option(s), ${params.context.activeRoute.waypoints.length} stop(s))`
       : "None currently loaded"
   }
+- Live navigation telemetry: ${navLine}
+- Live traffic feed: ${params.context.liveTraffic?.available ? `${params.context.liveTraffic.provider} (${params.context.liveTraffic.flow?.congestionLevel || "active"})` : "Not connected (OSRM road-speed estimates only)"}
 - Active community reports in workspace: ${(params.context.communityReports || []).length}
 - Driver preferences: ${params.context.preferences ? JSON.stringify(params.context.preferences) : "Default"}`;
 
@@ -586,9 +714,11 @@ STRICT GROUNDING & SAFETY RULES:
   let activeModel = MODEL_NAME;
 
   const callModel = async () => {
-    const modelsToTry = [activeModel, "gemini-3.1-flash-lite"].filter(
-      (m, i, arr) => arr.indexOf(m) === i,
-    );
+    const modelsToTry = [
+      activeModel,
+      "gemini-3.1-flash-lite",
+      "gemini-2.5-flash",
+    ].filter((m, i, arr) => arr.indexOf(m) === i);
     let lastErr: any;
     for (const model of modelsToTry) {
       try {

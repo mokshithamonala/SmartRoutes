@@ -7,6 +7,7 @@ export interface GeoPoint {
 
 export interface JourneyStop extends GeoPoint {
   id: string;
+  sourcePoiId?: string;
   category?: "parking" | "fuel" | "charging" | "rest" | "food" | "service" | "custom" | "emergency";
   source?: "osm" | "user" | "saved";
 }
@@ -29,6 +30,19 @@ export interface TurnComplexityAnalysis {
   roadSummary: string[];
 }
 
+export interface RouteStepInstruction {
+  index: number;
+  instruction: string;
+  roadName: string;
+  maneuverType: string;
+  modifier?: string;
+  distanceMeters: number;
+  durationSeconds: number;
+  lat: number;
+  lng: number;
+  exit?: number;
+}
+
 export interface RouteAlternative {
   routeId: string;
   label: string;
@@ -36,6 +50,7 @@ export interface RouteAlternative {
   durationMin: number;
   estimatedAvgSpeedKmh: number;
   geometry: Array<[number, number]>; // [lat, lng] pairs for Leaflet & 3D
+  steps: RouteStepInstruction[];
   turns: TurnComplexityAnalysis;
   qualityScore: number; // 0-100 explainable composite score
   scoreBreakdown: {
@@ -72,6 +87,7 @@ export interface DiscoveredPOI {
   lat: number;
   lng: number;
   address: string;
+  hasAddress?: boolean;
   distanceKm: number;
   accessibility?: string;
   openingHours?: string;
@@ -79,6 +95,10 @@ export interface DiscoveredPOI {
   availabilityStatus: string; // Never fabricated: e.g. "Unknown (no live sensor feed)"
   source: "OpenStreetMap Overpass" | "OpenStreetMap Nominatim";
   phone?: string;
+  website?: string;
+  brand?: string;
+  operator?: string;
+  referenceLabel?: string;
 }
 
 export interface CommunityReport {
@@ -122,25 +142,133 @@ export interface WeatherSnapshot {
   error?: string;
 }
 
+export interface LiveTrafficIncident {
+  id: string;
+  category: string;
+  description: string;
+  severity: "low" | "moderate" | "high";
+  lat: number;
+  lng: number;
+  delayMinutes?: number;
+}
+
+export interface LiveTrafficSnapshot {
+  available: boolean;
+  provider: string;
+  fetchedAt: number;
+  location: { lat: number; lng: number };
+  flow?: {
+    currentSpeedKmh: number;
+    freeFlowSpeedKmh: number;
+    congestionLevel: "free" | "moderate" | "heavy" | "severe";
+    confidence: number;
+  } | null;
+  incidents: LiveTrafficIncident[];
+  reason?: string;
+}
+
 export interface UrbanBuilding {
   id: string;
+  name?: string;
+  address?: string;
   footprint: Array<[number, number]>; // [lat, lng]
+  centerLat: number;
+  centerLng: number;
   heightMeters: number;
+  heightSource?: "osm_height" | "osm_levels" | "footprint_default";
   kind?: string;
 }
 
 export interface UrbanRoad {
   id: string;
+  name?: string;
   points: Array<[number, number]>; // [lat, lng]
   highway: string;
+  isBridge?: boolean;
+  layer?: number;
+  lanes?: number;
+}
+
+export interface UrbanPolygonFeature {
+  id: string;
+  name?: string;
+  kind: string;
+  footprint: Array<[number, number]>;
+  centerLat: number;
+  centerLng: number;
+}
+
+export interface UrbanPointFeature {
+  id: string;
+  name?: string;
+  category: string;
+  lat: number;
+  lng: number;
+  address?: string;
+}
+
+export interface UrbanTerrainGrid {
+  available: boolean;
+  source: string;
+  baseElevationM: number;
+  minElevationM: number;
+  maxElevationM: number;
+  gridSize: number;
+  bounds: {
+    minLat: number;
+    maxLat: number;
+    minLng: number;
+    maxLng: number;
+  };
+  elevations: number[]; // row-major gridSize x gridSize
 }
 
 export interface UrbanContextData {
   source: string;
   fetchedAt: number;
+  centerLat: number;
+  centerLng: number;
   buildings: UrbanBuilding[];
   roads: UrbanRoad[];
+  parks: UrbanPolygonFeature[];
+  waterBodies: UrbanPolygonFeature[];
+  trees: UrbanPointFeature[];
+  landmarks: UrbanPointFeature[];
+  terrain?: UrbanTerrainGrid | null;
   isFallbackGrid?: boolean;
+}
+
+export type VoiceLanguage = "en" | "hi" | "te";
+
+export interface LivePositionSnapshot {
+  lat: number;
+  lng: number;
+  heading: number | null; // degrees clockwise from North (0-360)
+  speedKmh: number | null;
+  accuracyM: number | null;
+  timestamp: number;
+  source: "gps" | "preview_simulation";
+}
+
+export interface LiveNavigationSnapshot {
+  status: "idle" | "gps_active" | "preview_demo" | "arrived";
+  isNavigating: boolean;
+  currentPosition: LivePositionSnapshot | null;
+  progressFraction: number; // 0..1
+  remainingDistanceKm: number;
+  remainingDurationMin: number;
+  etaTimestamp: number | null;
+  currentStepIndex: number;
+  distanceToNextStepM: number | null;
+  nextStep: RouteStepInstruction | null;
+  followingStep: RouteStepInstruction | null;
+  isOffRoute: boolean;
+  offRouteDistanceM: number;
+  isRecalculating: boolean;
+  gpsError: string | null;
+  voiceEnabled: boolean;
+  voiceLanguage: VoiceLanguage;
+  lastAnnouncement: string | null;
 }
 
 export interface SavedJourneyRecord {
@@ -192,7 +320,8 @@ export interface AgentToolTrace {
     | "Driver Safety Agent"
     | "Parking & Stop Discovery Agent"
     | "Emergency Assistance Agent"
-    | "Journey Summary Agent";
+    | "Journey Summary Agent"
+    | "Live Navigation Agent";
   toolName: string;
   status: "success" | "error";
   summary: string;

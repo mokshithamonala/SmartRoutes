@@ -17,6 +17,7 @@ import { SignOutButton } from "../SignOutButton";
 import {
   apiCalculateRoute,
   apiDiscoverPOIs,
+  apiFetchTraffic,
   apiFetchUrbanContext,
   apiFetchWeather,
   apiReverseGeocode,
@@ -28,6 +29,7 @@ import type {
   FavouriteDestination,
   GeoPoint,
   JourneyStop,
+  LiveTrafficSnapshot,
   PredictiveRouteResult,
   RoutePreferences,
   SavedJourneyRecord,
@@ -35,9 +37,10 @@ import type {
   UserPreferencesRecord,
   WeatherSnapshot,
 } from "../types/mobility";
+import { useLiveNavigation } from "../hooks/useLiveNavigation";
 import { MapViewport, type MapViewMode } from "./map/MapViewport";
 import { RoutePlannerPanel } from "./panels/RoutePlannerPanel";
-import { StopsAndParkingPanel } from "./panels/StopsAndParkingPanel";
+import { StopsAndParkingPanel, type POISearchMeta } from "./panels/StopsAndParkingPanel";
 import { SafetyAndCommunityPanel } from "./panels/SafetyAndCommunityPanel";
 import { EmergencyPanel } from "./panels/EmergencyPanel";
 import { InsightsAndProfilePanel } from "./panels/InsightsAndProfilePanel";
@@ -49,6 +52,19 @@ interface CommandCenterProps {
 }
 
 const DEFAULT_FALLBACK_CENTER = { lat: 40.7549, lng: -73.984 };
+
+function clientHaversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
 
 export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
   const navigate = useNavigate();
@@ -91,12 +107,17 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
   const [isCalculatingRoute, setIsCalculatingRoute] = useState(false);
 
   const [discoveredPOIs, setDiscoveredPOIs] = useState<DiscoveredPOI[]>([]);
+  const [selectedPOI, setSelectedPOI] = useState<DiscoveredPOI | null>(null);
+  const [poiSearchError, setPoiSearchError] = useState<string | null>(null);
+  const [poiSearchMeta, setPoiSearchMeta] = useState<POISearchMeta | null>(null);
   const [emergencyPOIs, setEmergencyPOIs] = useState<DiscoveredPOI[]>([]);
   const [isSearchingPOIs, setIsSearchingPOIs] = useState(false);
   const [isSearchingEmergency, setIsSearchingEmergency] = useState(false);
+  const poiRequestIdRef = useRef(0);
 
   const [urbanContext, setUrbanContext] = useState<UrbanContextData | null>(null);
   const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
+  const [liveTraffic, setLiveTraffic] = useState<LiveTrafficSnapshot | null>(null);
   const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
 
   // Viewport & Interaction State
@@ -135,18 +156,33 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
     setNightScene3D(theme === "dark");
   }, [theme]);
 
-  // Fetch real OSM 3D urban context & Open-Meteo weather whenever active route changes
+  // Clear stale stop results whenever destination coordinates change, and focus the map on the new destination
+  const destCoordKey = destination
+    ? `${destination.lat.toFixed(4)},${destination.lng.toFixed(4)}`
+    : "";
+  useEffect(() => {
+    setDiscoveredPOIs([]);
+    setSelectedPOI(null);
+    setPoiSearchError(null);
+    setPoiSearchMeta(null);
+    if (destination) {
+      setFocusPoint({ lat: destination.lat, lng: destination.lng });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [destCoordKey]);
+
+  // Fetch real OSM 3D urban context, Open-Meteo weather, and verified live traffic whenever route or destination changes
   useEffect(() => {
     const anchor = routeResult
       ? {
           lat: (routeResult.origin.lat + routeResult.destination.lat) / 2,
           lng: (routeResult.origin.lng + routeResult.destination.lng) / 2,
         }
-      : userLocation || DEFAULT_FALLBACK_CENTER;
+      : destination || userLocation;
 
     const weatherAnchor = routeResult
       ? routeResult.destination
-      : userLocation || DEFAULT_FALLBACK_CENTER;
+      : destination || userLocation || DEFAULT_FALLBACK_CENTER;
 
     let cancelled = false;
     void apiFetchWeather(weatherAnchor.lat, weatherAnchor.lng)
@@ -155,8 +191,16 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
       })
       .catch(() => {});
 
-    if (routeResult) {
-      void apiFetchUrbanContext(anchor.lat, anchor.lng, 650)
+    void apiFetchTraffic(weatherAnchor.lat, weatherAnchor.lng)
+      .then((snap) => {
+        if (!cancelled) setLiveTraffic(snap);
+      })
+      .catch(() => {});
+
+    if (anchor) {
+      // Reset previous destination's urban context cleanly before loading the new destination
+      setUrbanContext(null);
+      void apiFetchUrbanContext(anchor.lat, anchor.lng, 750)
         .then((ctx) => {
           if (!cancelled) setUrbanContext(ctx);
         })
@@ -166,7 +210,36 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
     return () => {
       cancelled = true;
     };
-  }, [routeResult, userLocation]);
+  }, [routeResult, destination, userLocation]);
+
+  // Progressive 3D urban context chunk loading as driver moves along route
+  const handleRequestUrbanChunk = useCallback((lat: number, lng: number) => {
+    void apiFetchUrbanContext(lat, lng, 650)
+      .then((chunk) => {
+        setUrbanContext((prev) => {
+          if (!prev) return chunk;
+          const mergeById = <T extends { id: string }>(a: T[], b: T[], maxLen: number): T[] => {
+            const map = new Map<string, T>();
+            for (const item of a) map.set(item.id, item);
+            for (const item of b) map.set(item.id, item);
+            return Array.from(map.values()).slice(-maxLen);
+          };
+          return {
+            ...prev,
+            source: chunk.source || prev.source,
+            fetchedAt: chunk.fetchedAt,
+            buildings: mergeById(prev.buildings, chunk.buildings, 220),
+            roads: mergeById(prev.roads, chunk.roads, 180),
+            parks: mergeById(prev.parks, chunk.parks, 50),
+            waterBodies: mergeById(prev.waterBodies, chunk.waterBodies, 35),
+            trees: mergeById(prev.trees, chunk.trees, 160),
+            landmarks: mergeById(prev.landmarks, chunk.landmarks, 50),
+            terrain: prev.terrain || chunk.terrain,
+          };
+        });
+      })
+      .catch(() => {});
+  }, []);
 
   // Combine standard + emergency POIs for synchronized map rendering
   const visibleMapPOIs = useMemo(() => {
@@ -204,7 +277,15 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
         if (persistToJourneyId && chosen) {
           await updateJourneyStopsMutation({
             journeyId: persistToJourneyId as any,
-            waypoints: result.waypoints,
+            waypoints: result.waypoints.map((w) => ({
+              id: w.id,
+              lat: w.lat,
+              lng: w.lng,
+              address: w.address,
+              label: w.label,
+              category: w.category,
+              source: w.source,
+            })),
             distanceKm: chosen.distanceKm,
             durationMin: chosen.durationMin,
             turnCount: chosen.turns.maneuverCount,
@@ -226,6 +307,38 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
     },
     [updateJourneyStopsMutation],
   );
+
+  // Automatic off-route recalculation from current live GPS coordinates
+  const handleRecalculateFromPosition = useCallback(
+    async (lat: number, lng: number) => {
+      const targetDest = routeResult?.destination || destination;
+      if (!targetDest) return;
+      const gpsOrigin: GeoPoint = {
+        lat,
+        lng,
+        address: `Live GPS (${lat.toFixed(4)}, ${lng.toFixed(4)})`,
+        label: "Current GPS Position",
+      };
+      setUserLocation({ lat, lng });
+      await runRouteCalculation(
+        gpsOrigin,
+        targetDest,
+        waypoints,
+        preferences,
+        Boolean(routeResult?.isEmergency),
+        activeSavedJourneyId,
+      );
+    },
+    [routeResult, destination, waypoints, preferences, activeSavedJourneyId, runRouteCalculation],
+  );
+
+  // Unified Live Navigation Controller shared across 2D, 3D, Split, Planner & AI Companion
+  const liveNav = useLiveNavigation({
+    routeResult,
+    selectedRouteId,
+    onRecalculateFromPosition: handleRecalculateFromPosition,
+    onRequestUrbanChunk: handleRequestUrbanChunk,
+  });
 
   // Workflow A: Calculate route from current planner state
   const handleCalculateRoute = () => {
@@ -253,7 +366,15 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
         name,
         origin: routeResult.origin,
         destination: routeResult.destination,
-        waypoints: routeResult.waypoints,
+        waypoints: routeResult.waypoints.map((w) => ({
+          id: w.id,
+          lat: w.lat,
+          lng: w.lng,
+          address: w.address,
+          label: w.label,
+          category: w.category,
+          source: w.source,
+        })),
         selectedRouteId: chosen.routeId,
         distanceKm: chosen.distanceKm,
         durationMin: chosen.durationMin,
@@ -300,6 +421,7 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
               ? Number((journey.distanceKm / (journey.durationMin / 60)).toFixed(1))
               : 0,
           geometry: journey.geometry,
+          steps: [],
           turns: {
             totalSteps: journey.turnCount,
             maneuverCount: journey.turnCount,
@@ -376,65 +498,144 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
     );
   };
 
-  // Workflow B: Discover real OSM parking/EV/fuel/rest stops
-  const handleDiscoverPOIs = async (
-    category: string,
-    anchor: "destination" | "midpoint" | "origin",
-  ) => {
-    let target = userLocation || DEFAULT_FALLBACK_CENTER;
-    if (routeResult) {
-      if (anchor === "origin") target = routeResult.origin;
-      else if (anchor === "destination") target = routeResult.destination;
-      else {
-        const activeAlt =
-          routeResult.alternatives.find((a) => a.routeId === selectedRouteId) ||
-          routeResult.alternatives[0];
-        if (activeAlt && activeAlt.geometry.length > 0) {
-          const mid = activeAlt.geometry[Math.floor(activeAlt.geometry.length / 2)];
-          target = { lat: mid[0], lng: mid[1] };
-        } else {
+  // Workflow B: Discover real OSM parking/EV/fuel/rest/food/service stops around active reference location
+  const handleDiscoverPOIs = useCallback(
+    async (
+      category: string,
+      anchor: "destination" | "midpoint" | "origin",
+      radiusMeters = 5000,
+    ) => {
+      const effDest = destination || routeResult?.destination || null;
+      const effOrigin = origin || routeResult?.origin || null;
+
+      let target: { lat: number; lng: number } | null = null;
+      let referenceLabel = "";
+
+      if (anchor === "destination" && effDest) {
+        target = { lat: effDest.lat, lng: effDest.lng };
+        referenceLabel = effDest.label || effDest.address.split(",")[0] || "Destination";
+      } else if (anchor === "origin" && effOrigin) {
+        target = { lat: effOrigin.lat, lng: effOrigin.lng };
+        referenceLabel = effOrigin.label || effOrigin.address.split(",")[0] || "Origin";
+      } else if (anchor === "midpoint") {
+        if (routeResult) {
+          const activeAlt =
+            routeResult.alternatives.find((a) => a.routeId === selectedRouteId) ||
+            routeResult.alternatives[0];
+          if (activeAlt && activeAlt.geometry.length > 0) {
+            const mid = activeAlt.geometry[Math.floor(activeAlt.geometry.length / 2)];
+            target = { lat: mid[0], lng: mid[1] };
+          } else {
+            target = {
+              lat: (routeResult.origin.lat + routeResult.destination.lat) / 2,
+              lng: (routeResult.origin.lng + routeResult.destination.lng) / 2,
+            };
+          }
+          referenceLabel = "Route Midpoint";
+        } else if (effOrigin && effDest) {
           target = {
-            lat: (routeResult.origin.lat + routeResult.destination.lat) / 2,
-            lng: (routeResult.origin.lng + routeResult.destination.lng) / 2,
+            lat: (effOrigin.lat + effDest.lat) / 2,
+            lng: (effOrigin.lng + effDest.lng) / 2,
           };
+          referenceLabel = "Journey Midpoint";
+        }
+      } else if (effDest) {
+        target = { lat: effDest.lat, lng: effDest.lng };
+        referenceLabel = effDest.label || effDest.address.split(",")[0] || "Destination";
+      } else if (effOrigin) {
+        target = { lat: effOrigin.lat, lng: effOrigin.lng };
+        referenceLabel = effOrigin.label || effOrigin.address.split(",")[0] || "Origin";
+      } else if (userLocation) {
+        target = userLocation;
+        referenceLabel = "Current Location";
+      }
+
+      if (!target) {
+        setPoiSearchError(
+          "Select a destination or origin first so stops can be searched around your actual location.",
+        );
+        return;
+      }
+
+      const requestId = ++poiRequestIdRef.current;
+      setIsSearchingPOIs(true);
+      setPoiSearchError(null);
+      setSelectedPOI(null);
+      setPoiSearchMeta({
+        category,
+        anchor,
+        radiusMeters,
+        referenceLabel,
+        referenceLat: target.lat,
+        referenceLng: target.lng,
+      });
+
+      try {
+        const rawPois = await apiDiscoverPOIs({
+          lat: target.lat,
+          lng: target.lng,
+          category,
+          radiusMeters,
+          limit: 15,
+        });
+
+        // Ignore stale response if user switched destination or category while in flight
+        if (requestId !== poiRequestIdRef.current) return;
+
+        // Enforce client-side geographic sanity & attach reference label consistently
+        const maxKm = radiusMeters / 1000;
+        const verifiedPois = rawPois
+          .map((p) => ({
+            ...p,
+            distanceKm: Number(
+              clientHaversineKm(target!.lat, target!.lng, p.lat, p.lng).toFixed(2),
+            ),
+            referenceLabel,
+          }))
+          .filter((p) => p.distanceKm <= maxKm + 0.05)
+          .sort((a, b) => a.distanceKm - b.distanceKm);
+
+        setDiscoveredPOIs(verifiedPois);
+        setFocusPoint({ lat: target.lat, lng: target.lng });
+      } catch (err: any) {
+        if (requestId !== poiRequestIdRef.current) return;
+        const msg =
+          err?.message || "Failed to fetch nearby OpenStreetMap stops. Please retry.";
+        setDiscoveredPOIs([]);
+        setPoiSearchError(msg);
+        toast.error(msg);
+      } finally {
+        if (requestId === poiRequestIdRef.current) {
+          setIsSearchingPOIs(false);
         }
       }
-    } else if (destination) {
-      target = destination;
-    } else if (origin) {
-      target = origin;
-    }
+    },
+    [destination, origin, routeResult, selectedRouteId, userLocation],
+  );
 
-    setIsSearchingPOIs(true);
-    try {
-      const pois = await apiDiscoverPOIs({
-        lat: target.lat,
-        lng: target.lng,
-        category,
-        radiusMeters: 3500,
-        limit: 12,
-      });
-      setDiscoveredPOIs(pois);
-      setFocusPoint({ lat: target.lat, lng: target.lng });
-      if (pois.length === 0) {
-        toast.info(`No OpenStreetMap ${category} stops found within 3.5 km.`);
-      } else {
-        toast.success(`Found ${pois.length} real OpenStreetMap ${category} stop(s).`);
-      }
-    } catch (err: any) {
-      toast.error(err?.message || "Failed to query OpenStreetMap stops.");
-    } finally {
-      setIsSearchingPOIs(false);
-    }
-  };
-
-  // Workflow B: Add stop to journey, recalculate OSRM, sync 2D/3D, update saved journey if active
+  // Workflow B: Add stop to journey with duplicate prevention, recalculate OSRM, sync 2D/3D
   const handleAddPOIToRoute = (poi: DiscoveredPOI) => {
+    const duplicate = waypoints.some(
+      (w) =>
+        (w.sourcePoiId && w.sourcePoiId === poi.id) ||
+        clientHaversineKm(w.lat, w.lng, poi.lat, poi.lng) < 0.05,
+    );
+    if (duplicate) {
+      toast.info(`"${poi.name}" is already in your route stops.`);
+      return;
+    }
+
+    const resolvedAddress =
+      poi.address && poi.address !== "Not available"
+        ? poi.address
+        : `${poi.lat.toFixed(5)}, ${poi.lng.toFixed(5)}`;
+
     const newStop: JourneyStop = {
-      id: `stop_${poi.id}_${Date.now()}`,
+      id: `stop_${poi.id}`,
+      sourcePoiId: poi.id,
       lat: poi.lat,
       lng: poi.lng,
-      address: poi.address,
+      address: resolvedAddress,
       label: poi.name,
       category:
         poi.category === "hospital" || poi.category === "police" || poi.category === "fire"
@@ -445,6 +646,8 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
 
     const nextWaypoints = [...waypoints, newStop];
     setWaypoints(nextWaypoints);
+    setSelectedPOI(poi);
+    setFocusPoint({ lat: poi.lat, lng: poi.lng });
 
     const effOrigin = origin || routeResult?.origin;
     const effDest = destination || routeResult?.destination;
@@ -458,14 +661,14 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
         false,
         activeSavedJourneyId,
       );
+    } else if (effDest) {
+      toast.success(
+        `Added "${poi.name}" as a route stop. Set an origin in Planner to calculate the full route.`,
+      );
     } else {
-      setDestination({
-        lat: poi.lat,
-        lng: poi.lng,
-        address: poi.address,
-        label: poi.name,
-      });
-      toast.info(`Added ${poi.name}. Set an origin & destination to calculate the full route.`);
+      toast.success(
+        `Added "${poi.name}" as a route stop. Set an origin and destination in Planner to calculate the route.`,
+      );
     }
   };
 
@@ -729,6 +932,7 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
                     );
                     setCompanionOpen(true);
                   }}
+                  liveNav={liveNav}
                 />
               }
             />
@@ -737,12 +941,28 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
               path="/stops"
               element={
                 <StopsAndParkingPanel
+                  origin={origin}
+                  destination={destination}
+                  waypoints={waypoints}
+                  favourites={favourites}
                   routeResult={routeResult}
                   discoveredPOIs={discoveredPOIs}
+                  selectedPOI={selectedPOI}
                   isSearchingPOIs={isSearchingPOIs}
-                  onDiscoverPOIs={(cat, anchor) => void handleDiscoverPOIs(cat, anchor)}
+                  poiSearchError={poiSearchError}
+                  poiSearchMeta={poiSearchMeta}
+                  onChangeDestination={setDestination}
+                  onDiscoverPOIs={(cat, anchor, radius) =>
+                    void handleDiscoverPOIs(cat, anchor, radius)
+                  }
+                  onSelectPOI={setSelectedPOI}
                   onAddStopToJourney={handleAddPOIToRoute}
                   onFocusPoint={(lat, lng) => setFocusPoint({ lat, lng })}
+                  onRequestMapPickDestination={() => {
+                    if (viewMode === "3d") setViewMode("split");
+                    setMapPickMode("destination");
+                  }}
+                  onUseCurrentLocation={handleUseCurrentLocation}
                 />
               }
             />
@@ -849,11 +1069,20 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
             routeResult={routeResult}
             selectedRouteId={selectedRouteId}
             onSelectRoute={setSelectedRouteId}
+            destination={destination}
+            waypoints={waypoints}
             discoveredPOIs={visibleMapPOIs}
+            selectedPOI={selectedPOI}
+            onSelectPOI={(poi) => {
+              setSelectedPOI(poi);
+              setFocusPoint({ lat: poi.lat, lng: poi.lng });
+            }}
             onAddPOIToRoute={handleAddPOIToRoute}
             communityReports={communityReports}
             urbanContext={urbanContext}
             weather={weather}
+            liveTraffic={liveTraffic}
+            liveNav={liveNav}
             theme={theme}
             nightScene3D={nightScene3D}
             onToggleNightScene3D={() => setNightScene3D((n) => !n)}
@@ -874,6 +1103,8 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
         communityReports={communityReports}
         preferences={savedPreferences || null}
         userLocation={userLocation}
+        liveNavigation={liveNav.snapshot}
+        liveTraffic={liveTraffic}
         onExecuteMapAction={handleExecuteCompanionAction}
         pendingPrompt={pendingAIPrompt}
         onConsumePendingPrompt={() => setPendingAIPrompt(null)}

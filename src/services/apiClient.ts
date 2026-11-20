@@ -4,6 +4,8 @@ import type {
   DiscoveredPOI,
   GeoPoint,
   JourneyStop,
+  LiveNavigationSnapshot,
+  LiveTrafficSnapshot,
   PredictiveRouteResult,
   RoutePreferences,
   UrbanContextData,
@@ -64,13 +66,15 @@ export async function apiDiscoverPOIs(params: {
     lat: String(params.lat),
     lng: String(params.lng),
     category: params.category,
-    radius: String(params.radiusMeters || 3500),
-    limit: String(params.limit || 12),
+    radius: String(params.radiusMeters || 5000),
+    limit: String(params.limit || 15),
   });
   const res = await fetch(`/api/poi/search?${q.toString()}`);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Stop discovery failed");
-  return data.pois || [];
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Stop discovery failed (HTTP ${res.status})`);
+  }
+  return Array.isArray(data.pois) ? data.pois : [];
 }
 
 export async function apiFetchUrbanContext(
@@ -86,8 +90,15 @@ export async function apiFetchUrbanContext(
     return {
       source: "Unavailable",
       fetchedAt: Date.now(),
+      centerLat: lat,
+      centerLng: lng,
       buildings: [],
       roads: [],
+      parks: [],
+      waterBodies: [],
+      trees: [],
+      landmarks: [],
+      terrain: null,
       isFallbackGrid: true,
     };
   }
@@ -104,6 +115,28 @@ export async function apiFetchWeather(
   return (await res.json()) as WeatherSnapshot;
 }
 
+export async function apiFetchTraffic(
+  lat: number,
+  lng: number,
+): Promise<LiveTrafficSnapshot> {
+  try {
+    const res = await fetch(
+      `/api/traffic?lat=${lat.toFixed(4)}&lng=${lng.toFixed(4)}`,
+    );
+    return (await res.json()) as LiveTrafficSnapshot;
+  } catch {
+    return {
+      available: false,
+      provider: "TomTom Live Traffic API",
+      fetchedAt: Date.now(),
+      location: { lat, lng },
+      flow: null,
+      incidents: [],
+      reason: "Live traffic endpoint unreachable; using OSRM road-speed estimates.",
+    };
+  }
+}
+
 export async function apiAskCompanion(params: {
   message: string;
   activeRoute?: PredictiveRouteResult | null;
@@ -111,6 +144,8 @@ export async function apiAskCompanion(params: {
   communityReports?: CommunityReport[];
   preferences?: Partial<UserPreferencesRecord> | null;
   userLocation?: { lat: number; lng: number } | null;
+  liveNavigation?: LiveNavigationSnapshot | null;
+  liveTraffic?: LiveTrafficSnapshot | null;
   history?: Array<{ role: "user" | "assistant"; content: string }>;
 }): Promise<CompanionResponse> {
   const res = await fetch("/api/ai/companion", {
@@ -124,6 +159,8 @@ export async function apiAskCompanion(params: {
         communityReports: params.communityReports,
         preferences: params.preferences,
         userLocation: params.userLocation,
+        liveNavigation: params.liveNavigation,
+        liveTraffic: params.liveTraffic,
         history: params.history,
       },
     }),

@@ -25,6 +25,8 @@ import type {
   AgentToolTrace,
   CommunityReport,
   CompanionMapAction,
+  LiveNavigationSnapshot,
+  LiveTrafficSnapshot,
   PredictiveRouteResult,
   UserPreferencesRecord,
 } from "../../types/mobility";
@@ -44,18 +46,20 @@ interface DrivingCompanionDrawerProps {
   communityReports: CommunityReport[];
   preferences: UserPreferencesRecord | null;
   userLocation: { lat: number; lng: number } | null;
+  liveNavigation?: LiveNavigationSnapshot | null;
+  liveTraffic?: LiveTrafficSnapshot | null;
   onExecuteMapAction: (action: CompanionMapAction) => void;
   pendingPrompt?: string | null;
   onConsumePendingPrompt?: () => void;
 }
 
 const QUICK_PROMPTS = [
-  "Plan a driving route from Bryant Park to Brooklyn Bridge",
+  "How far is my destination and what is my estimated arrival time?",
+  "When is my next turn and am I on the correct route?",
+  "What places and stops are nearby my destination?",
   "Compare fastest vs lowest turn complexity on my active route",
-  "Find parking near my destination",
   "Check road safety, community reports, and weather on my route",
   "Find nearby hospitals and compute an emergency route",
-  "Generate a pre-drive journey briefing",
 ];
 
 export function DrivingCompanionDrawer({
@@ -66,6 +70,8 @@ export function DrivingCompanionDrawer({
   communityReports,
   preferences,
   userLocation,
+  liveNavigation,
+  liveTraffic,
   onExecuteMapAction,
   pendingPrompt,
   onConsumePendingPrompt,
@@ -132,6 +138,8 @@ export function DrivingCompanionDrawer({
         communityReports,
         preferences,
         userLocation,
+        liveNavigation,
+        liveTraffic,
         history,
       });
 

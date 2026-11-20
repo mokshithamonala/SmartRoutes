@@ -1,8 +1,9 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import express from "express";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { createServer as createViteServer } from "vite";
+import { createServer as createViteServer, type ViteDevServer } from "vite";
 import {
   calculatePredictiveRoute,
   resolveOsrmBaseUrl,
@@ -14,11 +15,52 @@ import {
   fetchUrbanContext,
 } from "./server/services/poiAndUrbanService";
 import { getWeatherContext } from "./server/services/weatherService";
+import { getLiveTrafficContext } from "./server/services/trafficService";
 import { runMultiAgentCompanion } from "./server/services/geminiAgentService";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.PORT || 3000);
+
+// Load .env.local first (if present), then .env (without overriding existing process.env secrets)
+const envLocalPath = path.resolve(__dirname, ".env.local");
+if (fs.existsSync(envLocalPath)) {
+  dotenv.config({ path: envLocalPath, override: false });
+}
+dotenv.config({ override: false });
+
+function parseCliArgs(argv: string[]): { port: number; host: string } {
+  let port = Number(process.env.PORT || 3000);
+  let host = process.env.HOST || "0.0.0.0";
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--port" && argv[i + 1]) {
+      const parsed = Number(argv[i + 1]);
+      if (Number.isFinite(parsed) && parsed > 0) port = parsed;
+      i++;
+    } else if (arg.startsWith("--port=")) {
+      const parsed = Number(arg.slice("--port=".length));
+      if (Number.isFinite(parsed) && parsed > 0) port = parsed;
+    } else if (arg === "--host" && argv[i + 1]) {
+      host = argv[i + 1];
+      i++;
+    } else if (arg.startsWith("--host=")) {
+      host = arg.slice("--host=".length);
+    }
+  }
+
+  return { port, host };
+}
+
+const { port: PORT, host: HOST } = parseCliArgs(process.argv.slice(2));
 const IS_PROD = process.env.NODE_ENV === "production";
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[SmartRoutes] Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[SmartRoutes] Uncaught exception:", err);
+});
 
 async function startServer() {
   const app = express();
@@ -29,6 +71,7 @@ async function startServer() {
     res.json({
       status: "ok",
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      liveTrafficConfigured: Boolean(process.env.TOMTOM_API_KEY?.trim()),
       osrmBaseUrl: resolveOsrmBaseUrl(),
       nominatimBaseUrl:
         process.env.NOMINATIM_BASE_URL || "https://nominatim.openstreetmap.org",
@@ -113,22 +156,40 @@ async function startServer() {
       const lat = Number(req.query.lat);
       const lng = Number(req.query.lng);
       const category = String(req.query.category || "parking");
-      const radiusMeters = req.query.radius ? Number(req.query.radius) : 3500;
-      const limit = req.query.limit ? Number(req.query.limit) : 12;
+      const rawRadius = req.query.radius ? Number(req.query.radius) : 5000;
+      const radiusMeters = Number.isFinite(rawRadius)
+        ? Math.min(Math.max(rawRadius, 500), 25000)
+        : 5000;
+      const rawLimit = req.query.limit ? Number(req.query.limit) : 15;
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(Math.max(rawLimit, 1), 30)
+        : 15;
 
-      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-        return res.status(400).json({ error: "Valid lat and lng are required." });
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lng) ||
+        lat < -90 ||
+        lat > 90 ||
+        lng < -180 ||
+        lng > 180
+      ) {
+        return res
+          .status(400)
+          .json({ error: "Valid latitude (-90..90) and longitude (-180..180) are required." });
       }
 
       const pois = await discoverPOIs({ lat, lng, category, radiusMeters, limit });
       return res.json({
         pois,
+        reference: { lat, lng },
+        radiusMeters,
+        category,
         attribution: "© OpenStreetMap contributors",
         fetchedAt: Date.now(),
       });
     } catch (err: any) {
       return res.status(502).json({
-        error: err?.message || "POI discovery failed",
+        error: err?.message || "OpenStreetMap stop discovery failed",
         pois: [],
       });
     }
@@ -151,9 +212,42 @@ async function startServer() {
       return res.json(context);
     } catch (err: any) {
       return res.status(502).json({
+        source: "Unavailable",
+        fetchedAt: Date.now(),
+        centerLat: Number(req.query.lat) || 0,
+        centerLng: Number(req.query.lng) || 0,
         error: err?.message || "Urban context unavailable",
         buildings: [],
         roads: [],
+        parks: [],
+        waterBodies: [],
+        trees: [],
+        landmarks: [],
+        terrain: null,
+        isFallbackGrid: true,
+      });
+    }
+  });
+
+  // Verified Live Traffic Provider (TomTom when TOMTOM_API_KEY is configured; transparent otherwise)
+  app.get("/api/traffic", async (req, res) => {
+    try {
+      const lat = Number(req.query.lat);
+      const lng = Number(req.query.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return res.status(400).json({ error: "Valid lat and lng are required." });
+      }
+      const traffic = await getLiveTrafficContext(lat, lng);
+      return res.json(traffic);
+    } catch (err: any) {
+      return res.status(502).json({
+        available: false,
+        provider: "TomTom Live Traffic API",
+        fetchedAt: Date.now(),
+        location: { lat: Number(req.query.lat) || 0, lng: Number(req.query.lng) || 0 },
+        flow: null,
+        incidents: [],
+        reason: err?.message || "Live traffic service unavailable",
       });
     }
   });
@@ -205,9 +299,10 @@ async function startServer() {
   });
 
   // Frontend serving (Vite dev middleware in dev, dist/ static in prod)
+  let vite: ViteDevServer | null = null;
   if (!IS_PROD) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false },
+    vite = await createViteServer({
+      server: { middlewareMode: true, hmr: false, allowedHosts: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -219,9 +314,39 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`SmartRoutes 3.0 server running on http://0.0.0.0:${PORT}`);
+  // Express error boundary so malformed/failed requests never terminate the process
+  app.use(
+    (
+      err: any,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      console.error("[SmartRoutes] Express error:", err?.message || err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: err?.message || "Internal server error" });
+      }
+    },
+  );
+
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`SmartRoutes 3.0 server running on http://${HOST}:${PORT}`);
   });
+
+  server.on("error", (err) => {
+    console.error("[SmartRoutes] HTTP server error:", err);
+  });
+
+  const shutdown = async () => {
+    server.close();
+    if (vite) {
+      await vite.close().catch(() => {});
+    }
+    process.exit(0);
+  };
+
+  process.once("SIGTERM", () => void shutdown());
+  process.once("SIGINT", () => void shutdown());
 }
 
 startServer().catch((err) => {

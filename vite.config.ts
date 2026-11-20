@@ -10,6 +10,17 @@ export default defineConfig({
     port: 3000,
     allowedHosts: true,
   },
+  optimizeDeps: {
+    include: [
+      "three",
+      "three/examples/jsm/environments/RoomEnvironment.js",
+      "three/examples/jsm/controls/OrbitControls.js",
+      "@react-three/fiber",
+      "leaflet",
+      "react-leaflet",
+      "recharts",
+    ],
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

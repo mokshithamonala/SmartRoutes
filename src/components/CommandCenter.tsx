@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import {
   BarChart3,
+  Car,
   Compass,
+  Lock,
   Moon,
   ParkingSquare,
   ShieldAlert,
@@ -11,9 +13,10 @@ import {
   Sun,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useMutation, useQuery } from "../lib/convexAdapter";
+import { useAuthSession, useMutation, useQuery } from "../lib/convexAdapter";
 import { api } from "../../convex/_generated/api";
 import { SignOutButton } from "../SignOutButton";
+import { apiGetDriverStatus } from "../services/authClient";
 import {
   apiCalculateRoute,
   apiDiscoverPOIs,
@@ -69,7 +72,11 @@ function clientHaversineKm(lat1: number, lng1: number, lat2: number, lng2: numbe
 export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
   const navigate = useNavigate();
 
-  // Persistent Queries (Convex or localStorage-persisted adapter)
+  // Unified Backend JWT Auth & Driver Role State
+  const authSession = useAuthSession();
+  const [togglingDriverMode, setTogglingDriverMode] = useState(false);
+
+  // Persistent Queries (workspace store scoped by verified user id)
   const loggedInUser = useQuery(api.auth.loggedInUser);
   const savedJourneys = (useQuery(api.journeys.listUserJourneys) || []) as unknown as SavedJourneyRecord[];
   const communityReports = (useQuery(api.community.listActiveReports) || []) as unknown as CommunityReport[];
@@ -137,6 +144,42 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
   useEffect(() => {
     void initializeParking().catch(() => {});
   }, [initializeParking]);
+
+  // Verify protected Driver Mode status with backend when signed in as a driver
+  useEffect(() => {
+    if (!authSession.isDriver) return;
+    let cancelled = false;
+    void apiGetDriverStatus().catch(() => {
+      if (!cancelled) {
+        // Session synchronization handled by authClient if expired
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authSession.isDriver, authSession.user?.id]);
+
+  const handleToggleDriverMode = async () => {
+    if (!authSession.isDriver) {
+      toast.error(
+        "Driver Mode requires a signed-in driver account. Guest users cannot access restricted driver features.",
+      );
+      return;
+    }
+    setTogglingDriverMode(true);
+    try {
+      const nextActive = await authSession.toggleDriverMode();
+      toast.success(
+        nextActive
+          ? "Driver Mode activated and synced with your driver session."
+          : "Driver Mode deactivated.",
+      );
+    } catch (err: any) {
+      toast.error(err?.message || "Could not update Driver Mode.");
+    } finally {
+      setTogglingDriverMode(false);
+    }
+  };
 
   // Apply persisted user route preferences when loaded
   useEffect(() => {
@@ -872,6 +915,41 @@ export function CommandCenter({ theme, onToggleTheme }: CommandCenterProps) {
 
         {/* Zone 3: Compact Right Actions */}
         <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => void handleToggleDriverMode()}
+            disabled={togglingDriverMode}
+            title={
+              authSession.isDriver
+                ? authSession.driverModeActive
+                  ? "Driver Mode is active (click to deactivate)"
+                  : "Activate authenticated Driver Mode"
+                : "Sign in with a driver account to unlock Driver Mode"
+            }
+            className={`px-3 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 whitespace-nowrap transition-colors disabled:opacity-50 ${
+              authSession.driverModeActive
+                ? "bg-emerald-600 hover:bg-emerald-700 border-emerald-600 text-white"
+                : authSession.isDriver
+                  ? "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                  : "bg-slate-50 dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+            }`}
+          >
+            {authSession.isDriver ? (
+              <Car className="w-3.5 h-3.5" />
+            ) : (
+              <Lock className="w-3.5 h-3.5" />
+            )}
+            <span>
+              {togglingDriverMode
+                ? "Syncing..."
+                : authSession.driverModeActive
+                  ? "Driver Mode: On"
+                  : authSession.isGuest
+                    ? "Driver Mode (Sign in)"
+                    : "Driver Mode"}
+            </span>
+          </button>
+
           <button
             type="button"
             onClick={onToggleTheme}

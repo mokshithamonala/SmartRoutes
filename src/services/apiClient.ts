@@ -12,6 +12,7 @@ import type {
   UserPreferencesRecord,
   WeatherSnapshot,
 } from "../types/mobility";
+import { authFetch } from "./authClient";
 
 async function safeParseJson<T>(res: Response, fallbackLabel: string): Promise<T> {
   const contentType = res.headers.get("content-type") || "";
@@ -39,7 +40,7 @@ export async function apiSearchLocations(
     params.set("lat", String(near.lat));
     params.set("lng", String(near.lng));
   }
-  const res = await fetch(`/api/geo/search?${params.toString()}`);
+  const res = await authFetch(`/api/geo/search?${params.toString()}`);
   const data = await safeParseJson<{ results?: GeoPoint[]; error?: string }>(
     res,
     "Location search",
@@ -52,7 +53,7 @@ export async function apiReverseGeocode(
   lat: number,
   lng: number,
 ): Promise<GeoPoint> {
-  const res = await fetch(`/api/geo/reverse?lat=${lat}&lng=${lng}`);
+  const res = await authFetch(`/api/geo/reverse?lat=${lat}&lng=${lng}`);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "Reverse geocode failed");
   return data.point;
@@ -65,7 +66,7 @@ export async function apiCalculateRoute(params: {
   preferences?: Partial<RoutePreferences>;
   isEmergency?: boolean;
 }): Promise<PredictiveRouteResult> {
-  const res = await fetch("/api/routing/calculate", {
+  const res = await authFetch("/api/routing/calculate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(params),
@@ -89,7 +90,7 @@ export async function apiDiscoverPOIs(params: {
     radius: String(params.radiusMeters || 5000),
     limit: String(params.limit || 15),
   });
-  const res = await fetch(`/api/poi/search?${q.toString()}`);
+  const res = await authFetch(`/api/poi/search?${q.toString()}`);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(data.error || `Stop discovery failed (HTTP ${res.status})`);
@@ -102,7 +103,7 @@ export async function apiFetchUrbanContext(
   lng: number,
   radius = 650,
 ): Promise<UrbanContextData> {
-  const res = await fetch(
+  const res = await authFetch(
     `/api/geo/urban-context?lat=${lat.toFixed(5)}&lng=${lng.toFixed(5)}&radius=${radius}`,
   );
   const data = await res.json();
@@ -129,7 +130,7 @@ export async function apiFetchWeather(
   lat: number,
   lng: number,
 ): Promise<WeatherSnapshot> {
-  const res = await fetch(
+  const res = await authFetch(
     `/api/weather?lat=${lat.toFixed(4)}&lng=${lng.toFixed(4)}`,
   );
   return (await res.json()) as WeatherSnapshot;
@@ -140,7 +141,7 @@ export async function apiFetchTraffic(
   lng: number,
 ): Promise<LiveTrafficSnapshot> {
   try {
-    const res = await fetch(
+    const res = await authFetch(
       `/api/traffic?lat=${lat.toFixed(4)}&lng=${lng.toFixed(4)}`,
     );
     return (await res.json()) as LiveTrafficSnapshot;
@@ -206,7 +207,7 @@ export async function apiAskCompanion(params: {
 
   // Attempt once; if a reverse proxy returns transient HTML (e.g., 502/504 during warmup), retry once
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch("/api/ai/companion", {
+    const res = await authFetch("/api/ai/companion", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: payload,

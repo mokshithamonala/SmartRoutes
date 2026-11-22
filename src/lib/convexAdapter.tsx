@@ -8,19 +8,6 @@ import React, {
   type ReactNode,
 } from "react";
 import {
-  Authenticated as RealAuthenticated,
-  Unauthenticated as RealUnauthenticated,
-  ConvexReactClient,
-  useConvexAuth as useRealConvexAuth,
-  useQuery as useRealQuery,
-  useMutation as useRealMutation,
-  useAction as useRealAction,
-} from "convex/react";
-import {
-  ConvexAuthProvider,
-  useAuthActions as useRealAuthActions,
-} from "@convex-dev/auth/react";
-import {
   getFunctionName,
   type FunctionReference,
   type FunctionReturnType,
@@ -32,28 +19,20 @@ import type {
   SavedJourneyRecord,
   UserPreferencesRecord,
 } from "../types/mobility";
-import { api } from "../../convex/_generated/api";
+import {
+  apiAuthGuest,
+  apiAuthLogin,
+  apiAuthLogout,
+  apiAuthMe,
+  apiAuthRegister,
+  apiSetDriverMode,
+  authFetch,
+  onAuthExpired,
+  type AuthRole,
+  type AuthUser,
+} from "../services/authClient";
 
-const CONVEX_URL = import.meta.env.VITE_CONVEX_URL as string | undefined;
-export const USE_REAL_CONVEX = Boolean(
-  CONVEX_URL && /^https?:\/\//.test(CONVEX_URL.trim()),
-);
-
-const realConvexClient = USE_REAL_CONVEX
-  ? new ConvexReactClient(CONVEX_URL!.trim())
-  : null;
-
-type ConvexBackendMode = "real_full" | "real_hybrid" | "local_only";
-
-function isSmartRoutesV3Function(name: string): boolean {
-  return (
-    name.startsWith("journeys:") ||
-    name.startsWith("community:") ||
-    name.startsWith("preferences:")
-  );
-}
-
-const AdapterModeContext = createContext<ConvexBackendMode>("local_only");
+export const USE_REAL_CONVEX = false;
 
 const STORAGE_KEY = "smartroutes_v3_persisted_state";
 
@@ -61,7 +40,10 @@ interface LocalUser {
   _id: string;
   email?: string;
   name: string;
+  role: AuthRole;
   isAnonymous?: boolean;
+  isGuest: boolean;
+  driverModeActive: boolean;
 }
 
 interface LocalRoute {
@@ -129,7 +111,6 @@ interface LocalChatSession {
 }
 
 interface LocalStoreState {
-  user: LocalUser | null;
   routes: LocalRoute[];
   parkingSlots: LocalParkingSlot[];
   bookings: LocalBooking[];
@@ -247,7 +228,6 @@ function loadInitialState(): LocalStoreState {
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<LocalStoreState>;
       return {
-        user: parsed.user ?? null,
         routes: Array.isArray(parsed.routes) ? parsed.routes : [],
         parkingSlots:
           Array.isArray(parsed.parkingSlots) && parsed.parkingSlots.length > 0
@@ -272,7 +252,6 @@ function loadInitialState(): LocalStoreState {
     // ignore corrupted storage
   }
   return {
-    user: null,
     routes: [],
     parkingSlots: INITIAL_PARKING_SLOTS,
     bookings: [],
@@ -285,28 +264,77 @@ function loadInitialState(): LocalStoreState {
   };
 }
 
+function toAdapterUser(authUser: AuthUser | null): LocalUser | null {
+  if (!authUser) return null;
+  return {
+    _id: authUser.id,
+    email: authUser.email ?? undefined,
+    name: authUser.name,
+    role: authUser.role,
+    isAnonymous: authUser.isGuest,
+    isGuest: authUser.isGuest,
+    driverModeActive: authUser.driverModeActive,
+  };
+}
+
 interface LocalContextValue {
   state: LocalStoreState;
+  authUser: AuthUser | null;
   activeUser: LocalUser | null;
+  isAuthLoading: boolean;
   signIn: (provider: string, params?: FormData | Record<string, unknown>) => Promise<void>;
   signOut: () => Promise<void>;
+  toggleDriverMode: (next?: boolean) => Promise<boolean>;
+  refreshSession: () => Promise<void>;
   runMutation: (name: string, args: Record<string, any>) => Promise<any>;
   runAction: (name: string, args: Record<string, any>) => Promise<any>;
 }
 
 const LocalConvexContext = createContext<LocalContextValue | null>(null);
 
-function LocalConvexProvider({
-  children,
-  externalUser,
-}: {
-  children: ReactNode;
-  externalUser?: LocalUser | null;
-}) {
+function UnifiedSmartRoutesProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<LocalStoreState>(() => loadInitialState());
-  const activeUser = externalUser !== undefined ? externalUser : state.user;
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
 
-  // Persist to localStorage so journeys, favourites, preferences, and reports survive refresh
+  const activeUser = useMemo(() => toAdapterUser(authUser), [authUser]);
+
+  const refreshSession = useCallback(async () => {
+    try {
+      const res = await apiAuthMe();
+      setAuthUser(res.authenticated && res.user ? res.user : null);
+    } catch {
+      setAuthUser(null);
+    }
+  }, []);
+
+  // Re-hydrate authenticated driver or guest session from HttpOnly JWT cookie on boot/refresh
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiAuthMe();
+        if (!cancelled) {
+          setAuthUser(res.authenticated && res.user ? res.user : null);
+        }
+      } catch {
+        if (!cancelled) setAuthUser(null);
+      } finally {
+        if (!cancelled) setIsAuthLoading(false);
+      }
+    })();
+
+    const unsubscribe = onAuthExpired(() => {
+      setAuthUser(null);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  // Persist non-auth workspace data (journeys, favourites, preferences, reports) — NEVER tokens or auth user
   useEffect(() => {
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -315,12 +343,16 @@ function LocalConvexProvider({
     }
   }, [state]);
 
-  // Cross-tab reactive synchronization
+  // Cross-tab reactive synchronization for workspace data
   useEffect(() => {
     const onStorage = (ev: StorageEvent) => {
       if (ev.key === STORAGE_KEY && ev.newValue) {
         try {
-          setState(JSON.parse(ev.newValue) as LocalStoreState);
+          const parsed = JSON.parse(ev.newValue) as Partial<LocalStoreState>;
+          setState((prev) => ({
+            ...prev,
+            ...parsed,
+          }));
         } catch {
           // ignore
         }
@@ -332,39 +364,55 @@ function LocalConvexProvider({
 
   const signIn = useCallback(
     async (provider: string, params?: FormData | Record<string, unknown>) => {
-      if (provider === "anonymous") {
-        setState((prev) => ({
-          ...prev,
-          user: {
-            _id: "user_guest",
-            name: "Guest Driver",
-            isAnonymous: true,
-          },
-        }));
+      if (provider === "anonymous" || provider === "guest") {
+        const res = await apiAuthGuest();
+        setAuthUser(res.user);
         return;
       }
 
       const email =
         params instanceof FormData
-          ? String(params.get("email") || "driver@smartroutes.local").trim()
-          : String((params as Record<string, unknown>)?.email || "driver@smartroutes.local").trim();
+          ? String(params.get("email") || "").trim()
+          : String((params as Record<string, unknown>)?.email || "").trim();
+      const password =
+        params instanceof FormData
+          ? String(params.get("password") || "")
+          : String((params as Record<string, unknown>)?.password || "");
+      const flow =
+        params instanceof FormData
+          ? String(params.get("flow") || "signIn")
+          : String((params as Record<string, unknown>)?.flow || "signIn");
+      const name =
+        params instanceof FormData
+          ? String(params.get("name") || "").trim()
+          : String((params as Record<string, unknown>)?.name || "").trim();
 
-      setState((prev) => ({
-        ...prev,
-        user: {
-          _id: `user_${email.toLowerCase()}`,
-          email,
-          name: email.split("@")[0],
-          isAnonymous: false,
-        },
-      }));
+      const res =
+        flow === "signUp"
+          ? await apiAuthRegister(email, password, name || undefined)
+          : await apiAuthLogin(email, password);
+      setAuthUser(res.user);
     },
     [],
   );
 
   const signOut = useCallback(async () => {
-    setState((prev) => ({ ...prev, user: null }));
+    await apiAuthLogout();
+    setAuthUser(null);
   }, []);
+
+  const toggleDriverMode = useCallback(
+    async (next?: boolean): Promise<boolean> => {
+      const target =
+        typeof next === "boolean" ? next : !Boolean(authUser?.driverModeActive);
+      const res = await apiSetDriverMode(target);
+      if (res.user) {
+        setAuthUser(res.user);
+      }
+      return Boolean(res.driverModeActive ?? res.user?.driverModeActive);
+    },
+    [authUser?.driverModeActive],
+  );
 
   const runMutation = useCallback(
     async (name: string, args: Record<string, any> = {}) => {
@@ -789,7 +837,7 @@ function LocalConvexProvider({
   const runAction = useCallback(
     async (name: string, args: Record<string, any> = {}) => {
       if (name === "aiChatbot:generateIntelligentResponse" || name === "chat:generateBotResponse") {
-        const res = await fetch("/api/ai/companion", {
+        const res = await authFetch("/api/ai/companion", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message: args.message, context: args.context || {} }),
@@ -809,9 +857,31 @@ function LocalConvexProvider({
     [runMutation],
   );
 
-  const value = useMemo(
-    () => ({ state, activeUser, signIn, signOut, runMutation, runAction }),
-    [state, activeUser, signIn, signOut, runMutation, runAction],
+  const value = useMemo<LocalContextValue>(
+    () => ({
+      state,
+      authUser,
+      activeUser,
+      isAuthLoading,
+      signIn,
+      signOut,
+      toggleDriverMode,
+      refreshSession,
+      runMutation,
+      runAction,
+    }),
+    [
+      state,
+      authUser,
+      activeUser,
+      isAuthLoading,
+      signIn,
+      signOut,
+      toggleDriverMode,
+      refreshSession,
+      runMutation,
+      runAction,
+    ],
   );
 
   return (
@@ -821,149 +891,52 @@ function LocalConvexProvider({
   );
 }
 
-function HybridLocalBridge({ children }: { children: ReactNode }) {
-  const realUser = useRealQuery(api.auth.loggedInUser);
-  const externalUser: LocalUser | null = realUser
-    ? {
-        _id: String((realUser as any)._id),
-        email: (realUser as any).email,
-        name: (realUser as any).name || (realUser as any).email || "Driver",
-        isAnonymous: Boolean((realUser as any).isAnonymous),
-      }
-    : null;
-  return (
-    <LocalConvexProvider externalUser={externalUser}>
-      {children}
-    </LocalConvexProvider>
-  );
-}
-
 export function AppConvexProvider({ children }: { children: ReactNode }) {
-  const [mode, setMode] = useState<ConvexBackendMode | null>(() =>
-    USE_REAL_CONVEX && realConvexClient ? null : "local_only",
-  );
-
-  useEffect(() => {
-    if (!USE_REAL_CONVEX || !realConvexClient || !CONVEX_URL) return;
-    let cancelled = false;
-    const base = CONVEX_URL.trim().replace(/\/$/, "");
-
-    (async () => {
-      try {
-        const res = await fetch(`${base}/api/query`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            path: "journeys:listUserJourneys",
-            args: {},
-            format: "json",
-          }),
-          signal: AbortSignal.timeout(4000),
-        });
-        const data = await res.json();
-        if (!cancelled) {
-          if (res.ok && data?.status === "success") {
-            setMode("real_full");
-          } else {
-            console.info(
-              `[SmartRoutes] Convex deployment (${base}) does not yet have SmartRoutes 3.0 functions deployed; activating hybrid mode (real Convex Auth + persistent local store for journeys/community/preferences).`,
-            );
-            setMode("real_hybrid");
-          }
-        }
-      } catch {
-        if (!cancelled) setMode("real_hybrid");
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  if (mode === null) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950">
-        <div className="flex flex-col items-center gap-3">
-          <div className="animate-spin rounded-full h-9 w-9 border-2 border-slate-300 dark:border-slate-700 border-t-blue-600" />
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            Connecting to SmartRoutes backend...
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  if (mode === "real_full" && realConvexClient) {
-    return (
-      <AdapterModeContext.Provider value="real_full">
-        <ConvexAuthProvider client={realConvexClient}>
-          {children}
-        </ConvexAuthProvider>
-      </AdapterModeContext.Provider>
-    );
-  }
-
-  if (mode === "real_hybrid" && realConvexClient) {
-    return (
-      <AdapterModeContext.Provider value="real_hybrid">
-        <ConvexAuthProvider client={realConvexClient}>
-          <HybridLocalBridge>{children}</HybridLocalBridge>
-        </ConvexAuthProvider>
-      </AdapterModeContext.Provider>
-    );
-  }
-
-  return (
-    <AdapterModeContext.Provider value="local_only">
-      <LocalConvexProvider>{children}</LocalConvexProvider>
-    </AdapterModeContext.Provider>
-  );
+  return <UnifiedSmartRoutesProvider>{children}</UnifiedSmartRoutesProvider>;
 }
 
 export function Authenticated({ children }: { children: ReactNode }) {
-  const mode = useContext(AdapterModeContext);
-  if (mode !== "local_only") {
-    return <RealAuthenticated>{children}</RealAuthenticated>;
-  }
   const ctx = useContext(LocalConvexContext);
+  if (ctx?.isAuthLoading) return null;
   return ctx?.activeUser ? <>{children}</> : null;
 }
 
 export function Unauthenticated({ children }: { children: ReactNode }) {
-  const mode = useContext(AdapterModeContext);
-  if (mode !== "local_only") {
-    return <RealUnauthenticated>{children}</RealUnauthenticated>;
-  }
   const ctx = useContext(LocalConvexContext);
+  if (ctx?.isAuthLoading) return null;
   return !ctx?.activeUser ? <>{children}</> : null;
 }
 
 export function useConvexAuth() {
-  const mode = useContext(AdapterModeContext);
-  if (mode !== "local_only") {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    return useRealConvexAuth();
-  }
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   const ctx = useContext(LocalConvexContext);
   return {
-    isLoading: false,
+    isLoading: Boolean(ctx?.isAuthLoading),
     isAuthenticated: Boolean(ctx?.activeUser),
   };
 }
 
+export function useAuthSession() {
+  const ctx = useContext(LocalConvexContext);
+  const user = ctx?.authUser ?? null;
+  return {
+    user,
+    role: user?.role ?? null,
+    isAuthenticated: Boolean(user),
+    isGuest: Boolean(user?.isGuest || user?.role === "guest"),
+    isDriver: Boolean(user && user.role === "driver" && !user.isGuest),
+    driverModeActive: Boolean(user && user.role === "driver" && user.driverModeActive),
+    isLoading: Boolean(ctx?.isAuthLoading),
+    toggleDriverMode: ctx?.toggleDriverMode ?? (async () => false),
+    refreshSession: ctx?.refreshSession ?? (async () => {}),
+  };
+}
+
 export function useAuthActions() {
-  const mode = useContext(AdapterModeContext);
-  if (mode !== "local_only") {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    return useRealAuthActions();
-  }
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   const ctx = useContext(LocalConvexContext);
   return {
     signIn: async (provider: string, params?: any) => {
-      await ctx?.signIn(provider, params);
+      if (!ctx) throw new Error("Authentication provider missing.");
+      await ctx.signIn(provider, params);
       return { signingIn: true };
     },
     signOut: async () => {
@@ -976,28 +949,19 @@ export function useQuery<Query extends FunctionReference<"query">>(
   query: Query,
   ...args: OptionalRestArgs<Query> | ["skip"]
 ): FunctionReturnType<Query> | undefined {
-  const mode = useContext(AdapterModeContext);
   const name = getFunctionName(query);
-  const useReal =
-    mode === "real_full" ||
-    (mode === "real_hybrid" && !isSmartRoutesV3Function(name));
-
-  if (useReal) {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    return useRealQuery(query, ...(args as any));
-  }
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   const ctx = useContext(LocalConvexContext);
   if (!ctx || args[0] === "skip") {
     return undefined;
   }
 
   const queryArgs = (args[0] || {}) as Record<string, any>;
-  const { state, activeUser } = ctx;
+  const { state, activeUser, isAuthLoading } = ctx;
   const uid = activeUser?._id;
 
   switch (name) {
     case "auth:loggedInUser":
+      if (isAuthLoading) return undefined;
       return activeUser as any;
     case "journeys:listUserJourneys":
       return (uid ? state.savedJourneys.filter((j) => j.userId === uid) : []) as any;
@@ -1039,22 +1003,11 @@ export function useMutation<Mutation extends FunctionReference<"mutation">>(
 ): (
   ...args: OptionalRestArgs<Mutation>
 ) => Promise<FunctionReturnType<Mutation>> {
-  const mode = useContext(AdapterModeContext);
   const name = getFunctionName(mutation);
-  const useReal =
-    mode === "real_full" ||
-    (mode === "real_hybrid" && !isSmartRoutesV3Function(name));
-
-  if (useReal) {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    return useRealMutation(mutation) as any;
-  }
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   const ctx = useContext(LocalConvexContext);
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   return useCallback(
     async (...args: any[]) => {
-      if (!ctx) throw new Error("LocalConvexProvider missing");
+      if (!ctx) throw new Error("SmartRoutes provider missing");
       return ctx.runMutation(name, args[0] || {});
     },
     [ctx, name],
@@ -1064,22 +1017,11 @@ export function useMutation<Mutation extends FunctionReference<"mutation">>(
 export function useAction<Action extends FunctionReference<"action">>(
   action: Action,
 ): (...args: OptionalRestArgs<Action>) => Promise<FunctionReturnType<Action>> {
-  const mode = useContext(AdapterModeContext);
   const name = getFunctionName(action);
-  const useReal =
-    mode === "real_full" ||
-    (mode === "real_hybrid" && !isSmartRoutesV3Function(name));
-
-  if (useReal) {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    return useRealAction(action) as any;
-  }
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   const ctx = useContext(LocalConvexContext);
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   return useCallback(
     async (...args: any[]) => {
-      if (!ctx) throw new Error("LocalConvexProvider missing");
+      if (!ctx) throw new Error("SmartRoutes provider missing");
       return ctx.runAction(name, args[0] || {});
     },
     [ctx, name],

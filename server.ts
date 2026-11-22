@@ -17,6 +17,26 @@ import {
 import { getWeatherContext } from "./server/services/weatherService";
 import { getLiveTrafficContext } from "./server/services/trafficService";
 import { runMultiAgentCompanion } from "./server/services/geminiAgentService";
+import {
+  AuthServiceError,
+  assertAuthRateLimit,
+  createGuestSession,
+  isJwtSecretConfigured,
+  loginDriverAccount,
+  registerDriverAccount,
+  revokeAuthToken,
+  setDriverModeForUser,
+  verifySessionToken,
+} from "./server/services/authService";
+import {
+  clearSessionCookie,
+  corsMiddleware,
+  extractRequestToken,
+  optionalAuth,
+  requireAuth,
+  requireDriverRole,
+  setSessionCookie,
+} from "./server/middleware/authMiddleware";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -64,12 +84,15 @@ process.on("uncaughtException", (err) => {
 
 async function startServer() {
   const app = express();
+  app.set("trust proxy", 1);
+  app.use(corsMiddleware);
   app.use(express.json({ limit: "4mb" }));
 
   // Health & capability status (never exposes secrets)
   app.get("/api/health", (_req, res) => {
     res.json({
       status: "ok",
+      jwtConfigured: isJwtSecretConfigured(),
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
       liveTrafficConfigured: Boolean(process.env.TOMTOM_API_KEY?.trim()),
       osrmBaseUrl: resolveOsrmBaseUrl(),
@@ -79,8 +102,154 @@ async function startServer() {
     });
   });
 
+  // --- JWT Authentication & Role Authorization Endpoints ---
+
+  app.post("/api/auth/register", async (req, res) => {
+    try {
+      const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+      assertAuthRateLimit(`register:${clientIp}`);
+      const { email, password, name } = req.body || {};
+      const result = await registerDriverAccount({ email, password, name });
+      setSessionCookie(req, res, result.token, result.expiresIn);
+      return res.status(201).json({
+        authenticated: true,
+        user: result.user,
+        token: result.token,
+        expiresIn: result.expiresIn,
+      });
+    } catch (err: any) {
+      if (err instanceof AuthServiceError) {
+        return res.status(err.status).json({ error: err.message, code: err.code });
+      }
+      return res.status(500).json({ error: "Registration failed.", code: "REGISTER_ERROR" });
+    }
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+      assertAuthRateLimit(`login:${clientIp}`);
+      const { email, password } = req.body || {};
+      const result = await loginDriverAccount({ email, password });
+      setSessionCookie(req, res, result.token, result.expiresIn);
+      return res.json({
+        authenticated: true,
+        user: result.user,
+        token: result.token,
+        expiresIn: result.expiresIn,
+      });
+    } catch (err: any) {
+      if (err instanceof AuthServiceError) {
+        return res.status(err.status).json({ error: err.message, code: err.code });
+      }
+      return res.status(500).json({ error: "Sign in failed.", code: "LOGIN_ERROR" });
+    }
+  });
+
+  app.post("/api/auth/guest", async (req, res) => {
+    try {
+      const result = await createGuestSession();
+      setSessionCookie(req, res, result.token, result.expiresIn);
+      return res.json({
+        authenticated: true,
+        user: result.user,
+        token: result.token,
+        expiresIn: result.expiresIn,
+      });
+    } catch (err: any) {
+      if (err instanceof AuthServiceError) {
+        return res.status(err.status).json({ error: err.message, code: err.code });
+      }
+      return res.status(500).json({ error: "Guest session failed.", code: "GUEST_ERROR" });
+    }
+  });
+
+  app.get("/api/auth/me", async (req, res) => {
+    const { token } = extractRequestToken(req);
+    if (!token) {
+      return res.json({ authenticated: false, user: null, token: null });
+    }
+    try {
+      const session = await verifySessionToken(token);
+      return res.json({
+        authenticated: true,
+        user: session.user,
+        token,
+      });
+    } catch (err: any) {
+      clearSessionCookie(req, res);
+      if (err instanceof AuthServiceError) {
+        return res.status(err.status).json({
+          authenticated: false,
+          user: null,
+          error: err.message,
+          code: err.code,
+        });
+      }
+      return res.status(401).json({
+        authenticated: false,
+        user: null,
+        error: "Invalid authentication token.",
+        code: "TOKEN_INVALID",
+      });
+    }
+  });
+
+  app.post("/api/auth/logout", async (req, res) => {
+    const { token } = extractRequestToken(req);
+    if (token) {
+      try {
+        const session = await verifySessionToken(token);
+        revokeAuthToken(session.jti, session.exp);
+      } catch {
+        // Token already expired or invalid; still clear cookie cleanly
+      }
+    }
+    clearSessionCookie(req, res);
+    return res.json({ ok: true, authenticated: false });
+  });
+
+  // Protected Driver Mode toggle (authenticated driver role ONLY; guests blocked with 403)
+  app.post("/api/auth/driver-mode", requireAuth, requireDriverRole, async (req, res) => {
+    try {
+      const active = Boolean(req.body?.active);
+      const result = await setDriverModeForUser(req.auth!, active);
+      setSessionCookie(req, res, result.token, result.expiresIn);
+      return res.json({
+        authenticated: true,
+        driverModeActive: result.user.driverModeActive,
+        user: result.user,
+        token: result.token,
+        expiresIn: result.expiresIn,
+      });
+    } catch (err: any) {
+      if (err instanceof AuthServiceError) {
+        return res.status(err.status).json({ error: err.message, code: err.code });
+      }
+      return res.status(500).json({ error: "Could not update Driver Mode.", code: "DRIVER_MODE_ERROR" });
+    }
+  });
+
+  // Protected Driver Status & Capabilities endpoint (authenticated driver role ONLY)
+  app.get("/api/driver/status", requireAuth, requireDriverRole, (req, res) => {
+    const user = req.auth!.user;
+    return res.json({
+      role: user.role,
+      driverModeActive: user.driverModeActive,
+      user,
+      capabilities: {
+        driverMode: true,
+        liveGpsTelemetry: true,
+        saveJourneys: true,
+        submitCommunityReports: true,
+        managePreferences: true,
+      },
+      checkedAt: Date.now(),
+    });
+  });
+
   // OpenStreetMap Nominatim location search
-  app.get("/api/geo/search", async (req, res) => {
+  app.get("/api/geo/search", optionalAuth, async (req, res) => {
     try {
       const q = String(req.query.q || "").trim();
       if (q.length < 2) {
@@ -119,7 +288,7 @@ async function startServer() {
   });
 
   // OSRM Predictive Route Calculation (single & multi-stop)
-  app.post("/api/routing/calculate", async (req, res) => {
+  app.post("/api/routing/calculate", optionalAuth, async (req, res) => {
     try {
       const { origin, destination, waypoints, preferences, isEmergency } = req.body || {};
       if (
@@ -272,8 +441,8 @@ async function startServer() {
     }
   });
 
-  // Multi-Agent Gemini AI Driving Companion (server-side only)
-  app.post("/api/ai/companion", async (req, res) => {
+  // Multi-Agent Gemini AI Driving Companion (server-side only; requires valid driver or guest JWT)
+  app.post("/api/ai/companion", requireAuth, async (req, res) => {
     try {
       const { message, context } = req.body || {};
       if (!message || typeof message !== "string" || !message.trim()) {

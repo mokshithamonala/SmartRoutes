@@ -8,7 +8,7 @@ Built on the existing SmartRoutes application, version 3.0 extends its capabilit
 
 ## 🌐 Live Deployment & Repository
 
-- **Backend API:** [SmartRoutes Backend](https://smartroutes-backend.onrender.com/)
+- **Live Url:** [SmartRoutes Backend](https://smartroutes-backend.onrender.com/)
 - **GitHub Repository:** [SmartRoutes on GitHub](https://github.com/mokshithamonala/SmartRoutes)
 
 ## 🚀 Get Started

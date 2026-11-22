@@ -6,21 +6,29 @@ Built on the existing SmartRoutes application, version 3.0 extends its capabilit
 
 ## 🌐 Live Deployment
 
-**live url:** https://smartroutes-backend.onrender.com/
+**Backend API:** [https://smartroutes-backend.onrender.com/](https://smartroutes-backend.onrender.com/)
+## 🚀 Get Started
+**You can try SmartRoutes as a Guest, or Sign Up first to access your account and explore all features!**
 
-**GitHub Repository:** https://github.com/mokshithamonala/SmartRoutes
+**GitHub Repository:** [https://github.com/mokshithamonala/SmartRoutes](https://github.com/mokshithamonala/SmartRoutes)
 
 > Note: The backend URL is the deployed API endpoint, not necessarily the frontend application URL.
+
+## 🚀 Get Started
+
+**You can try SmartRoutes as a Guest, or Sign Up first to access your account and explore all features!**
 
 ## ✨ Key Features
 
 ### 🗺️ Intelligent 2D Navigation
+
 - Interactive maps powered by OpenStreetMap and Leaflet.
 - Driving route geometry, distance, and estimated travel duration through OSRM.
 - Location search and geocoding using Nominatim.
 - Nearby places and urban infrastructure discovery through Overpass API.
 
 ### 🌆 3D Urban Mobility Digital Twin
+
 - Immersive 3D city visualization using Three.js.
 - Extruded OpenStreetMap buildings and road networks.
 - Animated vehicles and synchronized route visualization.
@@ -28,18 +36,21 @@ Built on the existing SmartRoutes application, version 3.0 extends its capabilit
 - Dynamic Day/Night lighting modes.
 
 ### 🤖 AI Driving Companion
+
 - Gemini-powered conversational driving assistant.
 - Six modular AI function-calling tools.
 - Server-side AI integration using the Google GenAI SDK.
 - Intelligent assistance for navigation and mobility-related queries.
 
 ### 🌤️ Environmental Intelligence
+
 - Weather information through Open-Meteo.
 - Air quality monitoring and environmental context.
 - Environmental insights to support informed travel decisions.
 - Transparent handling of unavailable environmental data.
 
 ### 🚨 Smart Mobility & Community Support
+
 - Journey management and cloud persistence through Convex.
 - Community reports and user preferences.
 - Emergency decision-support information.
@@ -124,6 +135,7 @@ OVERPASS_BASE_URL=https://overpass-api.de/api/interpreter
 ## 💻 Installation & Setup
 
 ### Prerequisites
+
 - Node.js and npm
 - Git
 - Convex account (for cloud persistence)
@@ -206,12 +218,12 @@ SmartRoutes aims to make urban mobility smarter, safer, and more accessible by b
 
 **Sai Mokshitha Monala**
 
-- GitHub: https://github.com/mokshithamonala
-- Project Repository: https://github.com/mokshithamonala/SmartRoutes
-- Backend Deployment: https://smartroutes-backend.onrender.com/
+- GitHub: [https://github.com/mokshithamonala](https://github.com/mokshithamonala)
+- Project Repository: [https://github.com/mokshithamonala/SmartRoutes](https://github.com/mokshithamonala/SmartRoutes)
+- Backend Deployment: [https://smartroutes-backend.onrender.com/](https://smartroutes-backend.onrender.com/)
 
 ---
 
 <p align="center">
   <b>SmartRoutes 3.0 — Navigate Smarter. Drive Safer. Explore Better. 🚗</b>
-</p>
+</p>v
